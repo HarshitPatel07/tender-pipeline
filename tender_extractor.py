@@ -1,0 +1,1999 @@
+"""
+tender_extractor.py
+===================
+Free, zero-cost tender document summariser for ADCA India.
+
+Walks a Google Drive folder of tender sub-folders, reads every tender-issued
+document (PDF / DOCX / XLS, OCR-ing scanned pages), and extracts 13 summary
+fields per tender into an Excel workbook with page-level evidence.
+
+Two extraction layers:
+  1. RULES  - deterministic label/regex + section capture. Offline, free,
+              near-perfect on the fixed GeM bid template.
+  2. GEMINI - free-tier LLM pass for the judgement fields (Purpose, Eligibility,
+              Scope, Penalty) and to fill whatever rules missed.
+
+Where the two layers disagree on a money/date field, BOTH are reported and the
+cell is flagged CHECK. Nothing is ever silently guessed: a field that is not in
+the documents comes out as "NOT FOUND - verify manually".
+
+Runs in Google Colab or on a local PC. No paid services.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import html
+import io
+import json
+import os
+import re
+import shutil
+import sys
+import time
+import traceback
+from dataclasses import dataclass, field as dc_field
+from pathlib import Path
+
+# --------------------------------------------------------------------------
+# CONFIG  (the notebook overrides these)
+# --------------------------------------------------------------------------
+
+CONFIG = {
+    # Source of documents: "drive_link" or "local_folder"
+    "source_mode": "drive_link",
+    "drive_folder_url": "",
+    "local_folder": "",
+
+    # Working dirs
+    "work_dir": "tender_work",
+    "output_xlsx": "Tender_Summary.xlsx",
+    "output_html": "Tender_Dashboard.html",
+
+    # Folders/files to ignore (your own draft submissions, temp files)
+    "exclude_dir_names": ["WORKING FOLDER", "SCAN_OUT", "__MACOSX"],
+    "exclude_file_prefixes": ["~$", "."],
+
+    # OCR
+    "ocr_enabled": True,
+    "ocr_dpi": 300,
+    "ocr_lang": "eng",
+    "ocr_max_pages_per_file": 60,      # safety valve on giant scans
+    "text_layer_min_chars": 60,        # below this a page is treated as a scan
+
+    # Gemini
+    "use_gemini": True,
+    "gemini_api_key": "",
+    # Tried in order. When one is overloaded (503) the engine rotates to the
+    # next rather than hammering the same busy model.
+    "gemini_models": [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-flash-latest",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash",
+    ],
+    "gemini_chunk_chars": 180_000,     # per request; merged afterwards
+    "gemini_max_chunks": 6,
+    "gemini_retries": 6,               # rounds across the whole model list
+
+    # Caching: skip re-processing tenders whose files have not changed
+    "use_cache": True,
+    "verbose": True,
+}
+
+NOT_FOUND = "NOT FOUND - verify manually"
+
+FIELDS = [
+    ("tender_name",      "1. Tender Name"),
+    ("location",         "2. Location / Address"),
+    ("purpose",          "3. Purpose / Audit Type"),
+    ("period",           "4. Period"),
+    ("estimated_cost",   "5. Tender Estimated Cost"),
+    ("assignment_fees",  "6. Assignment Fees"),
+    ("eligibility",      "7. Eligibility Criteria"),
+    ("scope_of_work",    "8. Scope of Work"),
+    ("penalty",          "9. Penalty"),
+    ("emd",              "10. Tender EMD"),
+    ("sd",               "11. Tender SD"),
+    ("tender_fees",      "12. Tender Fees"),
+    ("submission_date",  "13. Tender Submission Date"),
+]
+
+MONEY_FIELDS = {"estimated_cost", "assignment_fees", "emd", "sd", "tender_fees"}
+DATE_FIELDS = {"submission_date"}
+PROSE_FIELDS = {"eligibility", "scope_of_work", "penalty", "purpose"}
+
+
+def log(*a):
+    if CONFIG.get("verbose"):
+        print(*a, flush=True)
+
+
+# --------------------------------------------------------------------------
+# 1. GOOGLE DRIVE  -  list a public folder recursively, download the files
+# --------------------------------------------------------------------------
+
+FOLDER_ID_RE = re.compile(r"/drive/folders/([\w-]+)")
+FILE_ID_RE = re.compile(r"/file/d/([\w-]+)")
+ANCHOR_RE = re.compile(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.S | re.I)
+TAG_RE = re.compile(r"<[^>]*>")
+
+
+def drive_folder_id(url_or_id: str) -> str:
+    url_or_id = (url_or_id or "").strip()
+    m = FOLDER_ID_RE.search(url_or_id)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([\w-]+)", url_or_id)
+    if m:
+        return m.group(1)
+    return url_or_id.rstrip("/").split("/")[-1].split("?")[0]
+
+
+def list_drive_folder(folder_id: str):
+    """List one Drive folder via the public embeddedfolderview endpoint.
+
+    Needs no API key and no login, as long as the folder is link-viewable.
+    Returns [{'name','id','is_folder'}].
+    """
+    import requests
+
+    url = f"https://drive.google.com/embeddedfolderview?id={folder_id}#list"
+    r = requests.get(url, timeout=60,
+                     headers={"User-Agent": "Mozilla/5.0 (tender-extractor)"})
+    r.raise_for_status()
+    items, seen = [], set()
+    for href, inner in ANCHOR_RE.findall(r.text):
+        name = html.unescape(TAG_RE.sub("", inner)).strip()
+        if not name:
+            continue
+        fm, dm = FOLDER_ID_RE.search(href), FILE_ID_RE.search(href)
+        if fm:
+            fid, is_folder = fm.group(1), True
+        elif dm:
+            fid, is_folder = dm.group(1), False
+        else:
+            continue
+        if fid in seen:
+            continue
+        seen.add(fid)
+        items.append({"name": name, "id": fid, "is_folder": is_folder})
+    return items
+
+
+def _excluded_dir(name: str) -> bool:
+    n = name.strip().upper()
+    return any(n == x.strip().upper() for x in CONFIG["exclude_dir_names"])
+
+
+def _excluded_file(name: str) -> bool:
+    return any(name.startswith(p) for p in CONFIG["exclude_file_prefixes"])
+
+
+def walk_drive(folder_id: str, rel: str = "", depth: int = 0, max_depth: int = 6):
+    """Recursively yield (relative_path, file_id) for every downloadable file."""
+    if depth > max_depth:
+        return
+    try:
+        items = list_drive_folder(folder_id)
+    except Exception as e:
+        log(f"   ! could not list folder {folder_id}: {e}")
+        return
+    for it in items:
+        if it["is_folder"]:
+            if _excluded_dir(it["name"]):
+                log(f"   - skipping (your own drafts): {rel}/{it['name']}")
+                continue
+            yield from walk_drive(it["id"], f"{rel}/{it['name']}".strip("/"),
+                                  depth + 1, max_depth)
+        else:
+            if _excluded_file(it["name"]):
+                continue
+            yield (f"{rel}/{it['name']}".strip("/"), it["id"])
+
+
+def download_drive_folder(url_or_id: str, dest: Path) -> Path:
+    """Mirror the shared Drive folder into `dest`, preserving structure."""
+    import gdown
+
+    root_id = drive_folder_id(url_or_id)
+    dest.mkdir(parents=True, exist_ok=True)
+    files = list(walk_drive(root_id))
+    if not files:
+        raise RuntimeError(
+            "No files found. Check that the Drive link is set to "
+            "'Anyone with the link - Viewer', or switch source_mode to "
+            "'local_folder' and use a mounted Drive path instead."
+        )
+    log(f"   found {len(files)} document(s) in Drive")
+    for rel, fid in files:
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and target.stat().st_size > 0:
+            continue
+        log(f"   downloading {rel}")
+        try:
+            gdown.download(id=fid, output=str(target), quiet=True)
+        except Exception as e:
+            log(f"   ! download failed for {rel}: {e}")
+    return dest
+
+
+# --------------------------------------------------------------------------
+# 2. TEXT EXTRACTION  -  PDF (with OCR fallback), DOCX, DOC, XLS/XLSX
+# --------------------------------------------------------------------------
+
+@dataclass
+class Page:
+    file: str          # relative filename
+    page: int          # 1-based page / sheet number (0 = whole file)
+    text: str
+    ocr: bool = False
+
+    @property
+    def ref(self) -> str:
+        p = f"p.{self.page}" if self.page else "whole file"
+        return f"{self.file} ({p}{', OCR' if self.ocr else ''})"
+
+
+def _clean(t: str) -> str:
+    t = t.replace("\u00a0", " ").replace("\r", "\n")
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def read_pdf(path: Path) -> list[Page]:
+    import fitz  # PyMuPDF
+
+    pages: list[Page] = []
+    try:
+        doc = fitz.open(str(path))
+    except Exception as e:
+        log(f"   ! cannot open PDF {path.name}: {e}")
+        return pages
+
+    ocr_used = 0
+    for i, pg in enumerate(doc, start=1):
+        try:
+            txt = pg.get_text("text") or ""
+        except Exception:
+            txt = ""
+        is_ocr = False
+        if (len(txt.strip()) < CONFIG["text_layer_min_chars"]
+                and CONFIG["ocr_enabled"]
+                and ocr_used < CONFIG["ocr_max_pages_per_file"]):
+            ocr_txt = _ocr_page(pg)
+            if len(ocr_txt.strip()) > len(txt.strip()):
+                txt, is_ocr = ocr_txt, True
+                ocr_used += 1
+        txt = _clean(txt)
+        if txt:
+            pages.append(Page(path.name, i, txt, is_ocr))
+    doc.close()
+    if ocr_used:
+        log(f"     ({ocr_used} scanned page(s) OCR-ed in {path.name})")
+    return pages
+
+
+def _ocr_page(pg) -> str:
+    try:
+        import pytesseract
+        from PIL import Image
+        import fitz
+
+        zoom = CONFIG["ocr_dpi"] / 72.0
+        pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        return pytesseract.image_to_string(img, lang=CONFIG["ocr_lang"])
+    except Exception as e:
+        log(f"   ! OCR unavailable/failed: {e}")
+        return ""
+
+
+def read_docx(path: Path) -> list[Page]:
+    try:
+        import docx
+    except Exception as e:
+        log(f"   ! python-docx missing: {e}")
+        return []
+    try:
+        d = docx.Document(str(path))
+    except Exception as e:
+        log(f"   ! cannot open {path.name}: {e}")
+        return []
+    parts = [p.text for p in d.paragraphs if p.text.strip()]
+    for tbl in d.tables:
+        for row in tbl.rows:
+            cells = [c.text.strip() for c in row.cells]
+            if any(cells):
+                parts.append(" | ".join(cells))
+    txt = _clean("\n".join(parts))
+    return [Page(path.name, 0, txt)] if txt else []
+
+
+def read_doc(path: Path) -> list[Page]:
+    """Legacy .doc: try LibreOffice conversion, else report as unreadable."""
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        log(f"   ! {path.name}: legacy .doc needs LibreOffice; skipped")
+        return []
+    outdir = path.parent / "_conv"
+    outdir.mkdir(exist_ok=True)
+    os.system(f'"{soffice}" --headless --convert-to docx --outdir '
+              f'"{outdir}" "{path}" >/dev/null 2>&1')
+    conv = outdir / (path.stem + ".docx")
+    return read_docx(conv) if conv.exists() else []
+
+
+def read_excel(path: Path) -> list[Page]:
+    try:
+        import pandas as pd
+    except Exception:
+        return []
+    pages = []
+    try:
+        sheets = pd.read_excel(str(path), sheet_name=None, header=None,
+                               dtype=str)
+    except Exception as e:
+        log(f"   ! cannot read {path.name}: {e}")
+        return []
+    for n, (name, df) in enumerate(sheets.items(), start=1):
+        df = df.fillna("")
+        rows = ["\t".join(str(v) for v in r if str(v).strip())
+                for r in df.values.tolist()]
+        txt = _clean(f"[Sheet: {name}]\n" + "\n".join(r for r in rows if r.strip()))
+        if len(txt) > 40:
+            pages.append(Page(path.name, n, txt))
+    return pages
+
+
+READERS = {
+    ".pdf": read_pdf, ".docx": read_docx, ".doc": read_doc,
+    ".xls": read_excel, ".xlsx": read_excel, ".xlsm": read_excel,
+    ".csv": read_excel, ".txt": lambda p: [Page(p.name, 0,
+                                                _clean(p.read_text(errors="ignore")))],
+}
+
+
+def read_any(path: Path) -> list[Page]:
+    fn = READERS.get(path.suffix.lower())
+    if not fn:
+        log(f"   - unsupported file type, skipped: {path.name}")
+        return []
+    try:
+        return fn(path)
+    except Exception:
+        log(f"   ! failed reading {path.name}\n{traceback.format_exc(limit=2)}")
+        return []
+
+
+# Documents most likely to hold the summary facts get read/ranked first.
+PRIORITY_HINTS = [
+    ("gem-bidding", 100), ("gem_bidding", 100), ("bid document", 90),
+    ("tender-summary", 95), ("tender summary", 95), ("nib", 85), ("nit", 85),
+    ("commercial-buyer", 80), ("tender", 60), ("boq", 40), ("attachment", 20),
+    ("upload documents", 5),
+]
+
+
+def file_priority(name: str) -> int:
+    n = name.lower()
+    return max((w for k, w in PRIORITY_HINTS if k in n), default=50)
+
+
+# --------------------------------------------------------------------------
+# 3. RULES LAYER  -  deterministic label / regex / section extraction
+# --------------------------------------------------------------------------
+
+@dataclass
+class Cand:
+    value: str = ""
+    ref: str = ""
+    conf: str = "low"          # high | medium | low
+    numeric: float | None = None
+    raw: str = ""
+
+
+CUR = r"(?:Rs\.?|INR|\u20b9|Rupees)"
+NUM = r"\d[\d,]*(?:\.\d+)?"
+MULT = r"(?:lakh?s?|lacs?|lac|crores?|cr\.?|thousand|million|mn)"
+
+AMOUNT_RE = re.compile(rf"({CUR})?\s*({NUM})\s*(/-)?\s*({MULT})?", re.I)
+
+# Labels from structured key-value templates (GeM and the like) where a bare
+# number with no "Rs." really is the amount. Everywhere else a bare number is
+# rejected, because in running prose it is nearly always a year, a clause
+# number, a tender number or a file name.
+BARE_OK_LABELS = {
+    r"EMD\s*Amount",
+    r"Estimated\s*Bid\s*Value",
+    r"Estimated\s*(?:Cost|Value|Amount|Contract\s*Value)",
+}
+BARE_MIN = 1000          # a bare number below this is not a rupee amount
+BARE_MAX = 1e10          # above this it is an account/reference number
+FILENAME_CTX = re.compile(r"\.pdf|\.xls|\.doc|Bidding-|Document-", re.I)
+
+MULTIPLIERS = {
+    "lakh": 1e5, "lakhs": 1e5, "lakh?s": 1e5, "lac": 1e5, "lacs": 1e5,
+    "crore": 1e7, "crores": 1e7, "cr": 1e7,
+    "thousand": 1e3, "million": 1e6, "mn": 1e6,
+}
+
+DATE_RE = re.compile(
+    r"(\d{1,2}[-/.\s](?:\d{1,2}|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
+    r"|January|February|March|April|June|July|August|September|October|November"
+    r"|December)[a-z]*[-/.\s]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)"
+    r"|((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})",
+    re.I)
+
+
+def parse_amount(window: str, allow_bare: bool = False):
+    """Return (numeric_value, display_string) for the first real amount found.
+
+    A number is only accepted as money when it carries a currency marker
+    ("Rs.", "INR", the rupee sign), a "/-" suffix, or a multiplier word
+    ("lakh", "crore"). Bare digits are accepted only when `allow_bare` is set,
+    which happens for structured key-value labels such as GeM's "EMD Amount".
+    This is what stops years, clause numbers, tender numbers and account
+    numbers being reported as rupee figures.
+    """
+    for m in AMOUNT_RE.finditer(window):
+        cur, raw_num, slash = m.group(1), m.group(2), m.group(3)
+        mult = (m.group(4) or "").lower().strip().rstrip(".")
+        if not raw_num or not raw_num.strip(",."):
+            continue
+
+        digits = raw_num.replace(",", "").split(".")[0]
+        # Leading zeros mean an identifier (account no., reference no.), not money.
+        if len(digits) > 1 and digits.startswith("0"):
+            continue
+        if len(digits) > 12:
+            continue
+
+        # Embedded in an identifier such as "T-168" or "Bidding-9722687"?
+        s = m.start(2)
+        if s > 0 and (window[s - 1] in "-/.:#" or window[s - 1].isalnum()):
+            continue
+
+        try:
+            val = float(raw_num.replace(",", ""))
+        except ValueError:
+            continue
+        if mult:
+            val *= MULTIPLIERS.get(mult, 1)
+
+        if window[m.end():m.end() + 2].lstrip().startswith("%"):
+            continue
+
+        has_marker = bool(cur or slash or mult)
+        if not has_marker:
+            if not allow_bare:
+                continue
+            if val < BARE_MIN or val > BARE_MAX:
+                continue
+            # A bare 4-digit number in the 1900-2100 range is a year.
+            if 1900 <= val <= 2100 and float(val).is_integer():
+                continue
+            # A bare number sitting next to a file name is part of the file name.
+            if FILENAME_CTX.search(window[max(0, s - 60): m.end() + 30]):
+                continue
+
+        disp = f"Rs. {val:,.0f}" if val == int(val) else f"Rs. {val:,.2f}"
+        return val, f"{disp}  [as written: {m.group(0).strip()}]"
+    return None, ""
+
+
+def parse_date(window: str) -> str:
+    m = DATE_RE.search(window)
+    return m.group(0).strip() if m else ""
+
+
+# field -> label regexes. Order matters: most specific label first.
+LABELS: dict[str, list[str]] = {
+    "emd": [
+        r"EMD\s*Amount",
+        r"Earnest\s*Money\s*Deposit",
+        r"\bEMD\b",
+        r"Earnest\s*Money",
+        r"Bid\s*Security(?:\s*Amount)?",
+    ],
+    "tender_fees": [
+        r"Tender\s*(?:Document\s*)?Fee",
+        r"Cost\s*of\s*(?:the\s*)?(?:Tender|Bid|RFP)\s*Document",
+        r"Bid\s*Document\s*(?:Fee|Cost)",
+        r"(?:e-?)?Tender\s*Processing\s*Fee",
+        r"Document\s*Fee",
+        r"Application\s*Fee",
+    ],
+    "sd": [
+        r"Security\s*Deposit",
+        r"Performance\s*(?:Bank\s*)?Guarantee",
+        r"Performance\s*Security",
+        r"\bPBG\b",
+        r"Retention\s*Money",
+    ],
+    "estimated_cost": [
+        r"Estimated\s*Bid\s*Value",
+        r"Estimated\s*(?:Cost|Value|Amount|Contract\s*Value)",
+        r"Approx(?:imate)?\s*(?:Cost|Value)",
+        r"Tender\s*Value",
+        r"Contract\s*Value",
+        r"Value\s*of\s*(?:the\s*)?(?:Work|Contract|Tender)",
+    ],
+    "assignment_fees": [
+        r"Assignment\s*Fee",
+        r"(?:Audit|Professional|Consultancy)\s*Fee",
+        r"Remuneration",
+        r"Fee\s*(?:Payable|Quoted)",
+    ],
+    "submission_date": [
+        r"Bid\s*End\s*Date(?:\s*/\s*Time)?",
+        r"Last\s*Date\s*(?:and|&)?\s*Time\s*(?:for|of)\s*(?:Online\s*)?"
+        r"(?:Submission|Receipt|Uploading)",
+        r"Last\s*Date\s*(?:for|of)\s*Submission",
+        r"(?:Bid|Tender)\s*Submission\s*(?:End|Closing|Last)\s*Date",
+        r"Due\s*Date\s*(?:and|&)?\s*Time",
+        r"Closing\s*Date(?:\s*(?:and|&)\s*Time)?",
+    ],
+    "period": [
+        r"Contract\s*Period",
+        r"Period\s*of\s*(?:Contract|Audit|Engagement|Assignment|Service)",
+        r"Audit\s*Period",
+        r"Duration\s*of\s*(?:Contract|Work|Assignment)",
+        r"for\s*the\s*(?:Financial\s*)?[Yy]ear",
+        r"Bid\s*Offer\s*Validity",
+    ],
+    "location": [
+        r"Buyer\s*Name\s*/?\s*Address",
+        # Full form only. Matching bare "Consignee" hits the plural heading
+        # "Consignees/Reporting Officer and Quantity" and captures its leftovers.
+        r"Consignee\s*/\s*Reporting\s*Officer\s*/\s*Address",
+        r"Organisation\s*Name",
+        r"Office\s*Name",
+        r"Address\s*of\s*(?:the\s*)?(?:Office|Department|Organisation)",
+        r"Place\s*of\s*(?:Work|Audit|Posting)",
+    ],
+    "purpose": [
+        r"Item\s*Category",
+        r"Name\s*of\s*(?:the\s*)?Work",
+        r"Nature\s*of\s*(?:Work|Service|Assignment)",
+        r"Type\s*of\s*Audit",
+        r"Subject",
+    ],
+    "tender_name": [
+        r"Bid\s*Number",
+        r"(?:Tender|NIT|NIB|RFP)\s*(?:Reference\s*)?(?:No|Number|ID)",
+        r"Name\s*of\s*(?:the\s*)?(?:Work|Tender|Project)",
+    ],
+}
+
+SECTION_HEADINGS: dict[str, list[str]] = {
+    "scope_of_work": [
+        r"SCOPE\s*OF\s*(?:THE\s*)?WORK",
+        r"SCOPE\s*OF\s*(?:AUDIT|SERVICES?|ASSIGNMENT)",
+        r"TERMS\s*OF\s*REFERENCE",
+        r"DETAILED\s*SCOPE",
+        r"WORK\s*TO\s*BE\s*(?:DONE|PERFORMED)",
+        r"DUTIES\s*(?:AND|&)\s*RESPONSIBILITIES",
+    ],
+    "eligibility": [
+        r"ELIGIBILITY\s*CRITERIA",
+        r"PRE[\s-]*QUALIFICATION(?:\s*CRITERIA)?",
+        r"MINIMUM\s*ELIGIBILITY",
+        r"QUALIFICATION\s*(?:CRITERIA|REQUIREMENTS)",
+        r"WHO\s*CAN\s*APPLY",
+        r"ELIGIBILITY\s*(?:CONDITIONS|REQUIREMENTS)",
+    ],
+    "penalty": [
+        r"PENALT(?:Y|IES)",
+        r"LIQUIDATED\s*DAMAGES?",
+        r"PENAL\s*(?:CLAUSE|PROVISION)",
+        r"DEDUCTIONS?\s*(?:AND|&)\s*PENALT",
+    ],
+}
+
+# A line that looks like the start of the next clause / heading.
+NEXT_HEADING_RE = re.compile(
+    r"^\s*(?:(?:\d+(?:\.\d+)*)[).]?\s+[A-Z]"
+    r"|[A-Z][A-Z0-9 ,\-&/()'.]{8,}\s*:?\s*$"
+    r"|(?:ANNEXURE|APPENDIX|SECTION|CHAPTER|CLAUSE|PART)\b)")
+
+SUBITEM_RE = re.compile(r"^\s*\(?[a-z0-9ivx]{1,3}[).]")
+
+
+def _ordered_pages(pages: list[Page]) -> list[Page]:
+    """Read the documents most likely to carry the facts first."""
+    return sorted(pages, key=lambda p: (-file_priority(p.file), p.file, p.page))
+
+
+HEADINGISH_RE = re.compile(
+    r"^\s*(?:\d+(?:\.\d+)*[).]?\s*)?[A-Z][A-Z0-9 ,\-&/()'.]{4,}\s*:?\s*$")
+
+# A line ending like this is mid-sentence, so the value continues on the next line.
+CONTINUES_RE = re.compile(
+    r"(?:\b(?:of|for|the|and|to|in|by|with|at|on|from|a|an)\b|[,;:\-\u2013])\s*$", re.I)
+
+
+DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
+
+
+def _is_junk_line(s: str) -> bool:
+    """Bilingual-template noise or an unfilled fill-in-the-blank line.
+
+    GeM's forms echo every label in Hindi beside the English one, and an
+    unanswered field ("N/a") often sits glued to that Hindi echo rather than
+    to a real value. A blank field on a print template shows as a run of
+    dots/underscores/dashes ("......, dated: ...... for Providing ......").
+    Both look like a value if only length is checked, so are filtered here.
+    """
+    if not s:
+        return True
+    if DEVANAGARI_RE.search(s):
+        return True
+    alnum = sum(ch.isalnum() for ch in s)
+    return len(s) >= 15 and alnum / len(s) < 0.35
+
+
+def _text_value(window: str) -> str:
+    """Pull a label's value, following it onto the next line when it wraps."""
+    lines = [ln.strip() for ln in window.split("\n")]
+    idx = next((i for i, ln in enumerate(lines) if ln.strip(" :|-.")), None)
+    if idx is None:
+        return ""
+    first = lines[idx].strip(" :|-")
+    # If we landed on the next heading instead of a value, this is not it.
+    if HEADINGISH_RE.match(first) and len(first) < 60:
+        return ""
+    # We landed inside the label itself, e.g. matching "Consignee" inside
+    # "Consignees/Reporting Officer" and capturing the leftover "s/Reporting...".
+    if re.match(r"^[a-z]{1,3}\s*[/)\]]", first):
+        return ""
+    if _is_junk_line(first):
+        return ""
+    parts = [first]
+    for nxt in lines[idx + 1: idx + 4]:
+        if not nxt or HEADINGISH_RE.match(nxt) or _is_junk_line(nxt):
+            break
+        if not (CONTINUES_RE.search(parts[-1]) or nxt[:1].islower()):
+            break
+        parts.append(nxt)
+        if len(" ".join(parts)) > 300:
+            break
+    return re.sub(r"\s{2,}", " ", " ".join(parts)).strip(" :|-")
+
+
+def _line_anchored(text: str, start: int, end: int) -> bool:
+    """True if the label starts its own line, or is immediately followed by ':'."""
+    bol = text.rfind("\n", 0, start) + 1
+    if re.fullmatch(r"[\s\u2022*\-]*(?:\d+(?:\.\d+)*[).]?\s*)?", text[bol:start]):
+        return True
+    return ":" in text[end:end + 3]
+
+
+def _label_lookup(pages: list[Page], patterns: list[str], kind: str) -> Cand:
+    # Pass 1 trusts only labels that head a line or carry a colon - that is a
+    # real field. Pass 2 relaxes it, so a label buried in prose is a fallback,
+    # never a first choice.
+    for strict in (True, False):
+        for pat in patterns:
+            rx = re.compile(pat, re.I)
+            for pg in _ordered_pages(pages):
+                for m in rx.finditer(pg.text):
+                    if strict and not _line_anchored(pg.text, m.start(), m.end()):
+                        continue
+                    # Money gets a short window. Many portals dump a page as
+                    # one short table cell per line with no real structure, so
+                    # a wide window drifts clean past an unrelated label (e.g.
+                    # "EMD BG ... to be uploaded on GeM Portal" has no amount
+                    # at all) into a completely different field's number
+                    # 200+ characters later. A real amount sits right next to
+                    # its label; if it isn't within a short distance, it is
+                    # not this field's value.
+                    span = 140 if kind == "money" else 320
+                    window = pg.text[m.end(): m.end() + span]
+                    # drop the bilingual Hindi echo / separators on the label
+                    window = re.sub(r"^[ \t:/|.\-\u2013\u2014]*", "", window)
+                    conf = "high" if strict else "medium"
+                    if kind == "money":
+                        # Bare digits only from a structured label, matched
+                        # line-anchored. In prose, currency must be present.
+                        val, disp = parse_amount(
+                            window, allow_bare=strict and pat in BARE_OK_LABELS)
+                        if val is not None:
+                            return Cand(disp, pg.ref, conf, val, m.group(0))
+                    elif kind == "date":
+                        d = parse_date(window)
+                        if d:
+                            return Cand(d, pg.ref, conf, None, m.group(0))
+                    else:
+                        v = _text_value(window)
+                        if len(v) >= 3:
+                            return Cand(v[:400], pg.ref,
+                                        "medium" if strict else "low",
+                                        None, m.group(0))
+    return Cand()
+
+
+def _capture_section(pages: list[Page], patterns: list[str],
+                     max_chars: int = 4000) -> Cand:
+    """Capture from a heading down to the next heading-looking line."""
+    best = Cand()
+    for pat in patterns:
+        rx = re.compile(pat, re.I)
+        for pg in _ordered_pages(pages):
+            # Only a heading that starts its own line is a real section
+            # heading. The same words inside a sentence ("...as defined in the
+            # scope of work above...") are a reference, not a section.
+            m = next((mm for mm in rx.finditer(pg.text)
+                      if _line_anchored(pg.text, mm.start(), mm.end())), None)
+            if not m:
+                continue
+            lines, first = [], True
+            for ln in pg.text[m.end():].split("\n"):
+                if first:
+                    first = False
+                    if ln.strip(" :.-"):
+                        lines.append(ln.strip())
+                    continue
+                joined_len = len("\n".join(lines))
+                if (joined_len > 200 and NEXT_HEADING_RE.match(ln)
+                        and not SUBITEM_RE.match(ln)):
+                    break
+                lines.append(ln.rstrip())
+                if joined_len > max_chars:
+                    break
+            body = _clean("\n".join(lines))
+            # A section that opens mid-sentence means the heading match landed
+            # inside a paragraph, so the text is a fragment, not the section.
+            if body and (body[0].islower() or body[0] in ",;/)]}.-–"):
+                continue
+            if len(body) > len(best.value):
+                best = Cand(body[:max_chars], pg.ref,
+                            "high" if len(body) > 300 else "medium")
+    return best
+
+
+GEM_BID_NO_RE = re.compile(r"(GEM/\d{4}/[BR]/\d+)", re.I)
+EPBG_RE = re.compile(r"ePBG\s*Percentage\s*\(?%?\)?\s*[:\-]?\s*(\d+(?:\.\d+)?)", re.I)
+
+
+def rules_extract(pages: list[Page], folder_name: str) -> dict[str, Cand]:
+    out: dict[str, Cand] = {}
+
+    for f in MONEY_FIELDS:
+        out[f] = _label_lookup(pages, LABELS.get(f, []), "money")
+    for f in DATE_FIELDS:
+        out[f] = _label_lookup(pages, LABELS.get(f, []), "date")
+    for f in ("period", "location", "purpose", "tender_name"):
+        out[f] = _label_lookup(pages, LABELS.get(f, []), "text")
+    for f, pats in SECTION_HEADINGS.items():
+        out[f] = _capture_section(pages, pats)
+
+    # A GeM bid number is an unambiguous identifier - prefer it.
+    for pg in _ordered_pages(pages):
+        m = GEM_BID_NO_RE.search(pg.text)
+        if m:
+            existing = out["tender_name"].value
+            extra = f" - {existing}" if existing and m.group(1) not in existing else ""
+            out["tender_name"] = Cand(m.group(1) + extra, pg.ref, "high")
+            break
+
+    # GeM bids carry no tender document fee. Saying so beats a blank cell that
+    # looks like the tool simply failed to find one.
+    is_gem = any(GEM_BID_NO_RE.search(p.text) for p in pages[:40])
+    if is_gem and not out.get("tender_fees", Cand()).value:
+        out["tender_fees"] = Cand(
+            "Nil - GeM bids carry no tender document fee",
+            "GeM bid document", "medium")
+
+    # ePBG is a percentage of contract value, not a rupee figure - label it as such.
+    for pg in _ordered_pages(pages):
+        m = EPBG_RE.search(pg.text)
+        if m:
+            note = f"ePBG {m.group(1)}% of contract value"
+            cur = out.get("sd", Cand())
+            joined = (cur.value + " | " if cur.value else "") + note
+            out["sd"] = Cand(joined, pg.ref, "high")
+            break
+
+    if not out["tender_name"].value:
+        out["tender_name"] = Cand(folder_name, "folder name", "low")
+    return out
+
+
+# --------------------------------------------------------------------------
+# 4. GEMINI LAYER  -  free-tier LLM pass for judgement fields and gap-filling
+# --------------------------------------------------------------------------
+
+PROMPT_HEADER = """You are a chartered-accountancy tender analyst in India.
+Below is the complete text of the documents issued for ONE tender. Page markers
+look like <<<FILE: name | PAGE: n>>>.
+
+Extract these 13 fields. Rules you must follow:
+- Use ONLY what the documents actually say. Never estimate, never infer a
+  typical value, never carry a number over from a different field.
+- If a field is genuinely not stated, set value to exactly: NOT FOUND
+- Amounts: give the rupee figure in digits, e.g. "Rs. 20,000". If the document
+  states a percentage instead (for example EMD/PBG as % of contract value),
+  give the percentage and what it is a percentage of.
+- Dates: copy them as written, including time if given.
+- source_file and page must be the file name and page number of the marker the
+  value came from. This is how a human verifies you, so it must be exact.
+- confidence: "high" only when the document states the value under a clear
+  label; "medium" when you had to read around it; "low" when unsure.
+
+Field meanings:
+1  tender_name      Tender / bid / NIT reference number and its title.
+2  location         Place of work, office address, city/district/state.
+3  purpose          What is being procured, i.e. the type of audit or service
+                    (statutory audit, internal audit, concurrent audit, stock
+                    audit, GST audit, physical verification, etc.).
+4  period           Audit period or contract/engagement duration (FY, months, years).
+5  estimated_cost   Tender estimated value / estimated contract cost.
+6  assignment_fees  Fee payable for the assignment (audit/professional fee),
+                    ceiling fee, or the fee basis if given per unit/branch.
+7  eligibility      Eligibility / pre-qualification criteria, as short bullets:
+                    firm status, years of experience, empanelment, number of
+                    partners/FCAs, turnover, past similar work, blacklisting.
+8  scope_of_work    Scope of work / terms of reference, as short bullets.
+9  penalty          Penalty, liquidated damages, deduction clauses, with amounts
+                    or percentages exactly as stated.
+10 emd              Earnest money deposit / bid security.
+11 sd               Security deposit / performance guarantee / PBG (state % if
+                    that is how it is expressed).
+12 tender_fees      Cost of tender document / bid processing or application fee.
+13 submission_date  Last date and time for bid submission (the deadline, not the
+                    publish date and not the opening date).
+
+Return ONLY a JSON object of this exact shape:
+{"fields": {"<field_key>": {"value": "...", "source_file": "...", "page": "...",
+"confidence": "high|medium|low"}, ...}}
+where field_key is one of: tender_name, location, purpose, period,
+estimated_cost, assignment_fees, eligibility, scope_of_work, penalty, emd, sd,
+tender_fees, submission_date
+"""
+
+
+def _gemini_client():
+    try:
+        from google import genai
+    except Exception as e:
+        log(f"   ! google-genai not installed ({e}); running rules-only")
+        return None, None
+    key = (CONFIG.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not key:
+        log("   ! no Gemini API key set; running rules-only")
+        return None, None
+    client = genai.Client(api_key=key)
+    wanted = list(CONFIG["gemini_models"])
+    for i, model in enumerate(wanted):
+        try:
+            client.models.generate_content(model=model, contents="ping")
+            # Put the verified model first, keep the rest as live fallbacks.
+            models = [model] + [m for m in wanted if m != model]
+            log(f"   Gemini ready: {model}  (fallbacks: "
+                f"{', '.join(models[1:3])}, ...)")
+            return client, models
+        except Exception as e:
+            msg = str(e)
+            if _overloaded(msg):
+                # Busy right now, but valid - keep it as a fallback.
+                log(f"   - {model} is busy; will retry it later")
+                continue
+            log(f"   - {model} unavailable ({msg[:80]})")
+            wanted[i] = None
+    live = [m for m in wanted if m]
+    if live:
+        log(f"   Gemini models all busy at start; will keep trying: {live[0]}")
+        return client, live
+    log("   ! no usable Gemini model; running rules-only")
+    return None, None
+
+
+def _corpus(pages: list[Page]) -> str:
+    parts = []
+    for pg in _ordered_pages(pages):
+        parts.append(f"<<<FILE: {pg.file} | PAGE: {pg.page}"
+                     f"{' | OCR' if pg.ocr else ''}>>>\n{pg.text}")
+    return "\n\n".join(parts)
+
+
+def _chunks(text: str) -> list[str]:
+    size = CONFIG["gemini_chunk_chars"]
+    if len(text) <= size:
+        return [text]
+    out, i = [], 0
+    while i < len(text) and len(out) < CONFIG["gemini_max_chunks"]:
+        cut = text.rfind("\n<<<FILE:", i + int(size * 0.6), i + size)
+        if cut == -1:
+            cut = min(i + size, len(text))
+        out.append(text[i:cut])
+        i = cut
+    return out
+
+
+def _parse_json(txt: str) -> dict:
+    txt = (txt or "").strip()
+    txt = re.sub(r"^```(?:json)?|```$", "", txt, flags=re.M).strip()
+    try:
+        return json.loads(txt)
+    except Exception:
+        pass
+    s, e = txt.find("{"), txt.rfind("}")
+    if s != -1 and e > s:
+        try:
+            return json.loads(txt[s:e + 1])
+        except Exception:
+            pass
+    return {}
+
+
+def _overloaded(msg: str) -> bool:
+    """503 / UNAVAILABLE - the model is busy. A different model may be free."""
+    m = msg.lower()
+    return ("503" in m or "unavailable" in m or "overloaded" in m
+            or "high demand" in m)
+
+
+def _rate_limited(msg: str) -> bool:
+    """429 - your free-tier quota. Every model shares it, so waiting is the fix."""
+    m = msg.lower()
+    return "429" in m or "resource_exhausted" in m or "quota" in m
+
+
+def _dead_model(msg: str) -> bool:
+    m = msg.lower()
+    return "404" in m or "not found" in m or "not supported" in m
+
+
+def _call_gemini(client, models: list[str], prompt: str) -> dict:
+    """Try each model in turn; rotate on overload, wait only on real quota limits."""
+    if isinstance(models, str):
+        models = [models]
+    live = [m for m in models if m]
+    delay = 10
+    for rnd in range(CONFIG["gemini_retries"]):
+        if not live:
+            break
+        for model in list(live):
+            try:
+                resp = client.models.generate_content(
+                    model=model, contents=prompt,
+                    config={"response_mime_type": "application/json",
+                            "temperature": 0},
+                )
+                out = _parse_json(getattr(resp, "text", ""))
+                if out:
+                    if rnd or model != models[0]:
+                        log(f"     succeeded on {model}")
+                    return out
+                log(f"   ! {model} returned nothing parseable")
+            except Exception as e:
+                msg = str(e)
+                if _overloaded(msg):
+                    log(f"   - {model} overloaded (503), trying next model")
+                    continue
+                if _dead_model(msg):
+                    log(f"   - {model} not available on this key, dropping it")
+                    live.remove(model)
+                    if model in models:
+                        models.remove(model)
+                    continue
+                if _rate_limited(msg):
+                    log(f"   - free-tier quota hit on {model}; "
+                        f"waiting {delay}s (quota is shared across models)")
+                    time.sleep(delay)
+                    delay = min(delay * 2, 120)
+                    continue
+                log(f"   ! {model} failed: {msg[:120]}")
+                continue
+        # Every model was busy this round - Google's side is genuinely loaded.
+        if rnd < CONFIG["gemini_retries"] - 1:
+            log(f"     all models busy; waiting {delay}s before round {rnd + 2}")
+            time.sleep(delay)
+            delay = min(delay * 2, 120)
+    log("   ! AI layer gave up on this chunk - rules-layer values will be used, "
+        "and this tender will NOT be cached so a re-run retries it")
+    return {}
+
+
+def _merge_ai(results: list[dict]) -> dict[str, Cand]:
+    """Merge per-chunk AI results: longest wins for prose, best confidence for scalars."""
+    rank = {"high": 3, "medium": 2, "low": 1, "": 0}
+    merged: dict[str, Cand] = {}
+    for res in results:
+        fields = (res or {}).get("fields") or {}
+        for key, _ in FIELDS:
+            item = fields.get(key)
+            if not isinstance(item, dict):
+                continue
+            val = str(item.get("value") or "").strip()
+            if not val or val.upper().startswith("NOT FOUND"):
+                continue
+            ref = str(item.get("source_file") or "").strip()
+            pageno = str(item.get("page") or "").strip()
+            if ref and pageno:
+                ref = f"{ref} (p.{pageno})"
+            conf = str(item.get("confidence") or "medium").lower()
+            cand = Cand(val, ref or "AI", conf if conf in rank else "medium")
+            cur = merged.get(key)
+            if cur is None:
+                merged[key] = cand
+            elif key in PROSE_FIELDS:
+                if len(val) > len(cur.value):
+                    merged[key] = cand
+            elif rank[cand.conf] > rank[cur.conf]:
+                merged[key] = cand
+    return merged
+
+
+def ai_extract(pages: list[Page], client, models):
+    """Returns (fields, ai_ok). ai_ok is False if every AI call failed."""
+    if not client:
+        return {}, True          # AI intentionally off - not a failure
+    corpus = _corpus(pages)
+    chunks = _chunks(corpus)
+    results = []
+    for n, ch in enumerate(chunks, start=1):
+        log(f"   Gemini pass {n}/{len(chunks)} ({len(ch):,} chars)")
+        results.append(_call_gemini(client, models, PROMPT_HEADER +
+                                    "\n\n===== DOCUMENTS =====\n" + ch))
+    ai_ok = any(bool(r) for r in results)
+    return _merge_ai(results), ai_ok
+
+
+# --------------------------------------------------------------------------
+# 5. MERGE  -  combine rules + AI, flag disagreements, never guess
+# --------------------------------------------------------------------------
+
+@dataclass
+class Result:
+    value: str = NOT_FOUND
+    ref: str = ""
+    conf: str = ""
+    rules_value: str = ""
+    ai_value: str = ""
+    flag: str = ""
+
+
+def _num(text: str) -> float | None:
+    m = re.search(r"(\d[\d,]*(?:\.\d+)?)", text or "")
+    if not m:
+        return None
+    try:
+        val = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    # Only a multiplier immediately after the digits scales them. Looking
+    # anywhere in the string wrongly scaled "Rs. 2,50,000/- (Rupees Two Lakhs
+    # fifty thousand only)" by another 100,000.
+    tail = (text or "")[m.end(): m.end() + 14].lower()
+    if re.match(r"\s*(?:/-)?\s*(?:crores?|cr\b)", tail):
+        val *= 1e7
+    elif re.match(r"\s*(?:/-)?\s*(?:lakh?s?|lacs?)", tail):
+        val *= 1e5
+    return val
+
+
+def merge(rules: dict[str, Cand], ai: dict[str, Cand]) -> dict[str, Result]:
+    out: dict[str, Result] = {}
+    for key, _ in FIELDS:
+        r = rules.get(key) or Cand()
+        a = ai.get(key) or Cand()
+        res = Result(rules_value=r.value, ai_value=a.value)
+
+        if a.value:
+            res.value, res.ref, res.conf = a.value, (a.ref or r.ref), a.conf
+        elif r.value:
+            res.value, res.ref, res.conf = r.value, r.ref, r.conf
+        else:
+            res.value, res.conf = NOT_FOUND, ""
+            res.flag = "NOT FOUND"
+            out[key] = res
+            continue
+
+        # Cross-check the money and date fields: two independent readers.
+        if key in MONEY_FIELDS and r.value and a.value:
+            rn, an = _num(r.value), _num(a.value)
+            if rn and an and abs(rn - an) > max(1.0, 0.01 * max(rn, an)):
+                res.flag = "CHECK - readers disagree"
+                res.value += f"   [rules read: {r.value.split('  [')[0]}]"
+                res.conf = "low"
+        if key in DATE_FIELDS and r.value and a.value:
+            rd = re.sub(r"\D", "", r.value)[:8]
+            ad = re.sub(r"\D", "", a.value)[:8]
+            if rd and ad and rd != ad:
+                res.flag = "CHECK - readers disagree"
+                res.value += f"   [rules read: {r.value}]"
+                res.conf = "low"
+
+        if not res.flag and res.conf == "low":
+            res.flag = "low confidence"
+        if not res.flag and any(w in (res.ref or "").upper() for w in ("OCR",)):
+            res.flag = "from OCR - verify digits"
+        out[key] = res
+    return out
+
+
+# --------------------------------------------------------------------------
+# 6. EXCEL OUTPUT
+# --------------------------------------------------------------------------
+
+LEGEND = [
+    ("How to read this workbook", ""),
+    ("Tender Summary", "One row per tender folder, the 13 requested fields."),
+    ("Evidence", "For every field: the source file and page it came from, plus "
+                 "what each of the two independent readers (rules and AI) read. "
+                 "Use this to verify a value in seconds."),
+    ("Documents Read", "Which files were opened, how many pages, how many "
+                       "needed OCR."),
+    ("", ""),
+    ("Cell colours", ""),
+    ("Amber", "Needs your eye: the two readers disagreed, confidence was low, "
+              "or the value came off a scanned page via OCR."),
+    ("Red", "Not stated anywhere in the documents that were read."),
+    ("", ""),
+    ("Important", "This tool eliminates the typing, not the review. Always "
+                  "confirm EMD, fees, and the submission deadline against the "
+                  "source page before acting on them."),
+    ("Excluded", "WORKING FOLDER is skipped by design - it holds your own "
+                 "draft submissions, not the department's tender documents."),
+]
+
+
+def write_excel(rows: list[dict], out_path: Path) -> Path:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    hdr_fill = PatternFill("solid", fgColor="1F3864")
+    hdr_font = Font(bold=True, color="FFFFFF", size=11)
+    amber = PatternFill("solid", fgColor="FFF2CC")
+    red = PatternFill("solid", fgColor="FCE4E4")
+    thin = Side(style="thin", color="BFBFBF")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    wrap = Alignment(wrap_text=True, vertical="top")
+
+    wb = Workbook()
+
+    # ---- Sheet 1: Tender Summary -----------------------------------------
+    ws = wb.active
+    ws.title = "Tender Summary"
+    headers = ["Tender Folder"] + [label for _, label in FIELDS] + ["Needs Review"]
+    ws.append(headers)
+    for c in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=c)
+        cell.fill, cell.font, cell.border = hdr_fill, hdr_font, box
+        cell.alignment = Alignment(wrap_text=True, vertical="center",
+                                   horizontal="center")
+    ws.row_dimensions[1].height = 34
+
+    for r_i, row in enumerate(rows, start=2):
+        res: dict[str, Result] = row["results"]
+        flags = [label for key, label in FIELDS if res[key].flag]
+        ws.cell(row=r_i, column=1, value=row["tender"])
+        for c_i, (key, _) in enumerate(FIELDS, start=2):
+            val = res[key].value
+            cell = ws.cell(row=r_i, column=c_i,
+                           value=val[:2000] if val else NOT_FOUND)
+            if res[key].flag == "NOT FOUND":
+                cell.fill = red
+            elif res[key].flag:
+                cell.fill = amber
+        ws.cell(row=r_i, column=len(headers),
+                value=(f"{len(flags)} field(s): " +
+                       ", ".join(f.split(". ", 1)[-1] for f in flags))
+                if flags else "clean")
+        for c in range(1, len(headers) + 1):
+            ws.cell(row=r_i, column=c).alignment = wrap
+            ws.cell(row=r_i, column=c).border = box
+        ws.row_dimensions[r_i].height = 150
+
+    widths = [18, 30, 26, 24, 16, 20, 20, 46, 52, 34, 20, 20, 18, 24, 30]
+    for i, w in enumerate(widths[:len(headers)], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "B2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(2, len(rows) + 1)}"
+
+    # ---- Sheet 2: Evidence -----------------------------------------------
+    ev = wb.create_sheet("Evidence")
+    ev_head = ["Tender", "Field", "Final Value", "Source (file, page)",
+               "Confidence", "Rules layer read", "AI layer read", "Flag"]
+    ev.append(ev_head)
+    for c in range(1, len(ev_head) + 1):
+        cell = ev.cell(row=1, column=c)
+        cell.fill, cell.font, cell.border = hdr_fill, hdr_font, box
+    r = 2
+    for row in rows:
+        res = row["results"]
+        for key, label in FIELDS:
+            x = res[key]
+            for c_i, v in enumerate([row["tender"], label, x.value, x.ref,
+                                     x.conf, x.rules_value, x.ai_value,
+                                     x.flag], start=1):
+                cell = ev.cell(row=r, column=c_i, value=str(v)[:1500])
+                cell.alignment = wrap
+                cell.border = box
+                if x.flag == "NOT FOUND":
+                    cell.fill = red
+                elif x.flag:
+                    cell.fill = amber
+            ev.row_dimensions[r].height = 42
+            r += 1
+    for i, w in enumerate([18, 26, 60, 34, 12, 40, 40, 24], start=1):
+        ev.column_dimensions[get_column_letter(i)].width = w
+    ev.freeze_panes = "C2"
+
+    # ---- Sheet 3: Documents Read -----------------------------------------
+    dr = wb.create_sheet("Documents Read")
+    dr.append(["Tender", "File", "Pages read", "Pages needing OCR", "Note"])
+    for c in range(1, 6):
+        cell = dr.cell(row=1, column=c)
+        cell.fill, cell.font, cell.border = hdr_fill, hdr_font, box
+    r = 2
+    for row in rows:
+        for f in row["files"]:
+            for c_i, v in enumerate([row["tender"], f["name"], f["pages"],
+                                     f["ocr"], f["note"]], start=1):
+                dr.cell(row=r, column=c_i, value=v).border = box
+            r += 1
+    for i, w in enumerate([18, 62, 12, 20, 40], start=1):
+        dr.column_dimensions[get_column_letter(i)].width = w
+    dr.freeze_panes = "A2"
+
+    # ---- Sheet 4: Read Me ------------------------------------------------
+    rm = wb.create_sheet("Read Me")
+    for a, b in LEGEND:
+        rm.append([a, b])
+    for i, row in enumerate(rm.iter_rows(min_row=1, max_col=2), start=1):
+        row[0].font = Font(bold=True)
+        row[1].alignment = Alignment(wrap_text=True, vertical="top")
+    rm.column_dimensions["A"].width = 28
+    rm.column_dimensions["B"].width = 92
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(out_path))
+    return out_path
+
+
+# --------------------------------------------------------------------------
+# 7. DRIVER
+# --------------------------------------------------------------------------
+
+def _gather_files(folder: Path) -> list[Path]:
+    files = []
+    for p in sorted(folder.rglob("*")):
+        if p.is_dir():
+            continue
+        if any(_excluded_dir(part) for part in p.relative_to(folder).parts[:-1]):
+            continue
+        if _excluded_file(p.name) or p.name.startswith("_conv"):
+            continue
+        if p.suffix.lower() in READERS:
+            files.append(p)
+    return sorted(files, key=lambda p: (-file_priority(p.name), p.name))
+
+
+def discover_tenders(root: Path) -> list[tuple[str, list[Path]]]:
+    """Each top-level sub-folder of root is one tender."""
+    tenders = []
+    subdirs = [d for d in sorted(root.iterdir())
+               if d.is_dir() and not _excluded_dir(d.name)]
+    for d in subdirs:
+        files = _gather_files(d)
+        if files:
+            tenders.append((d.name, files))
+        else:
+            log(f"   - {d.name}: no readable documents found")
+    loose = [p for p in sorted(root.glob("*")) if p.is_file()
+             and p.suffix.lower() in READERS and not _excluded_file(p.name)]
+    if loose and not tenders:
+        tenders.append((root.name, loose))
+    return tenders
+
+
+def _tender_hash(files: list[Path]) -> str:
+    h = hashlib.sha1()
+    for f in files:
+        try:
+            h.update(f"{f.name}:{f.stat().st_size}".encode())
+        except OSError:
+            h.update(f.name.encode())
+    return h.hexdigest()[:16]
+
+
+def process_tender(name: str, files: list[Path], client, models) -> dict:
+    log(f"\n== {name}  ({len(files)} document(s))")
+    pages: list[Page] = []
+    file_log = []
+    for f in files:
+        log(f"   reading {f.name}")
+        pgs = read_any(f)
+        pages.extend(pgs)
+        ocr_n = sum(1 for p in pgs if p.ocr)
+        file_log.append({
+            "name": f.name, "pages": len(pgs), "ocr": ocr_n,
+            "note": ("no text extracted - likely an image-only scan and OCR "
+                     "could not read it" if not pgs else
+                     ("scanned, read via OCR" if ocr_n else "")),
+        })
+    if not pages:
+        log("   ! no readable text in this tender folder")
+        empty = {k: Result(NOT_FOUND, "", "", "", "", "NOT FOUND")
+                 for k, _ in FIELDS}
+        return {"tender": name, "results": empty, "files": file_log,
+                "ai_ok": True}
+
+    total_chars = sum(len(p.text) for p in pages)
+    log(f"   {len(pages)} page(s), {total_chars:,} characters of text")
+    rules = rules_extract(pages, name)
+    ai, ai_ok = ai_extract(pages, client, models)
+    results = merge(rules, ai)
+    found = sum(1 for k, _ in FIELDS if results[k].value != NOT_FOUND)
+    note = ""
+    if not client:
+        note = " (rules only - no AI key)"
+    elif not ai_ok:
+        note = " (rules only - AI was unreachable; re-run to retry)"
+    log(f"   -> {found}/13 fields found{note}")
+    return {"tender": name, "results": results, "files": file_log,
+            "ai_ok": ai_ok}
+
+
+# Bumped when extraction logic changes, so stale caches from an older, weaker
+# version of the engine are ignored instead of silently reused.
+CACHE_VERSION = "v2"
+
+
+def _cache_path(work: Path, name: str, h: str) -> Path:
+    safe = re.sub(r"[^\w.-]", "_", name)
+    return work / "cache" / f"{safe}__{CACHE_VERSION}_{h}.json"
+
+
+def _to_json(row: dict) -> str:
+    return json.dumps({
+        "tender": row["tender"], "files": row["files"],
+        "ai_ok": row.get("ai_ok", True),
+        "results": {k: vars(v) for k, v in row["results"].items()},
+    }, ensure_ascii=False)
+
+
+def _from_json(txt: str) -> dict:
+    d = json.loads(txt)
+    return {"tender": d["tender"], "files": d["files"],
+            "ai_ok": d.get("ai_ok", True),
+            "results": {k: Result(**v) for k, v in d["results"].items()}}
+
+
+# Populated by run() so a caller (e.g. the notebook, to render the dashboard
+# inline) can get at the per-tender data without re-parsing the Excel.
+LAST_ROWS: list = []
+
+
+def run() -> Path:
+    global LAST_ROWS
+    t0 = time.time()
+    work = Path(CONFIG["work_dir"])
+    (work / "cache").mkdir(parents=True, exist_ok=True)
+
+    print("=" * 68)
+    print("TENDER SUMMARY EXTRACTOR")
+    print("=" * 68)
+
+    if CONFIG["source_mode"] == "drive_link":
+        print("\n[1/4] Fetching documents from Google Drive ...")
+        root = download_drive_folder(CONFIG["drive_folder_url"], work / "docs")
+    else:
+        root = Path(CONFIG["local_folder"]).expanduser()
+        print(f"\n[1/4] Using local folder: {root}")
+        if not root.exists():
+            raise FileNotFoundError(f"Folder not found: {root}")
+
+    print("\n[2/4] Finding tender folders ...")
+    tenders = discover_tenders(root)
+    if not tenders:
+        raise RuntimeError("No tender folders with readable documents found.")
+    print(f"   {len(tenders)} tender(s): " + ", ".join(t[0] for t in tenders))
+
+    print("\n[3/4] Reading documents and extracting fields ...")
+    client, models = (_gemini_client() if CONFIG["use_gemini"] else (None, None))
+
+    rows = []
+    for name, files in tenders:
+        cache = _cache_path(work, name, _tender_hash(files))
+        if CONFIG["use_cache"] and cache.exists():
+            try:
+                cached = _from_json(cache.read_text(encoding="utf-8"))
+                # Only reuse a cached tender that was fully extracted. One
+                # whose AI pass failed gets retried instead of being frozen in.
+                if cached.get("ai_ok", True):
+                    rows.append(cached)
+                    log(f"\n== {name}: unchanged since last run, using cache")
+                    continue
+                log(f"\n== {name}: cached run had no AI - redoing it")
+            except Exception:
+                pass
+        try:
+            row = process_tender(name, files, client, models)
+        except Exception:
+            log(f"   ! {name} failed:\n{traceback.format_exc(limit=3)}")
+            row = {"tender": name, "files": [], "ai_ok": True,
+                   "results": {k: Result(NOT_FOUND, "", "", "", "",
+                                         "processing error") for k, _ in FIELDS}}
+        rows.append(row)
+        if row.get("ai_ok", True):
+            try:
+                cache.write_text(_to_json(row), encoding="utf-8")
+            except Exception:
+                pass
+
+    LAST_ROWS = rows
+    print("\n[4/4] Writing Excel and dashboard ...")
+    out = write_excel(rows, Path(CONFIG["output_xlsx"]))
+    stamp = "Run " + time.strftime("%d %b %Y, %H:%M")
+    dash = write_dashboard(rows, Path(CONFIG["output_html"]), stamp=stamp)
+    print(f"   dashboard: {dash}  (double-click to open in any browser)")
+
+    total = len(rows) * len(FIELDS)
+    found = sum(1 for r in rows for k, _ in FIELDS
+                if r["results"][k].value != NOT_FOUND)
+    flagged = sum(1 for r in rows for k, _ in FIELDS if r["results"][k].flag)
+    print("\n" + "=" * 68)
+    print(f"DONE in {time.time() - t0:.0f}s   ->  {out}")
+    print(f"   tenders processed : {len(rows)}")
+    print(f"   fields filled     : {found}/{total}")
+    print(f"   fields to review  : {flagged}  (amber/red cells)")
+    no_ai = [r["tender"] for r in rows if not r.get("ai_ok", True)]
+    if no_ai:
+        print(f"   AI unreachable for: {', '.join(no_ai)}")
+        print("   -> these used the rules layer only. They were not cached, so")
+        print("      simply run this again later and only they get reprocessed.")
+    print("=" * 68)
+    return out
+
+
+# --------------------------------------------------------------------------
+# 8. HTML DASHBOARD  -  double-click to open, no software, no coding
+# --------------------------------------------------------------------------
+
+DASH_STYLE = """
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    --ground:      #F1F4F3;
+    --surface:     #FFFFFF;
+    --surface-sub: #E9EEEC;
+    --line:        #D3DCD9;
+    --line-soft:   #E4EAE8;
+    --ink:         #10262C;
+    --ink-soft:    #46605E;
+    --ink-faint:   #7B918D;
+    --accent:      #14655A;
+    --accent-soft: #DDEAE6;
+    --ok:          #2C7150;
+    --warn:        #9A6A11;
+    --warn-bg:     #FBF1DC;
+    --crit:        #9E3527;
+    --crit-bg:     #F9E5E1;
+    --shadow:      0 1px 2px rgba(16,38,44,.06), 0 6px 18px rgba(16,38,44,.05);
+    --shadow-hover: 0 2px 4px rgba(16,38,44,.09), 0 16px 30px rgba(16,38,44,.11);
+  }
+  :root:not([data-theme="light"]) { }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #0C1A1E;
+      --surface:     #132A2F;
+      --surface-sub: #1B363B;
+      --line:        #27474C;
+      --line-soft:   #1F3B40;
+      --ink:         #E7EEEC;
+      --ink-soft:    #A9C0BC;
+      --ink-faint:   #7B948F;
+      --accent:      #5BB9A6;
+      --accent-soft: #17403C;
+      --ok:          #63BA8D;
+      --warn:        #D9A94A;
+      --warn-bg:     #33290F;
+      --crit:        #E2867A;
+      --crit-bg:     #3A1D18;
+      --shadow:      0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.28);
+      --shadow-hover: 0 2px 6px rgba(0,0,0,.38), 0 18px 34px rgba(0,0,0,.34);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:      #0C1A1E;
+    --surface:     #132A2F;
+    --surface-sub: #1B363B;
+    --line:        #27474C;
+    --line-soft:   #1F3B40;
+    --ink:         #E7EEEC;
+    --ink-soft:    #A9C0BC;
+    --ink-faint:   #7B948F;
+    --accent:      #5BB9A6;
+    --accent-soft: #17403C;
+    --ok:          #63BA8D;
+    --warn:        #D9A94A;
+    --warn-bg:     #33290F;
+    --crit:        #E2867A;
+    --crit-bg:     #3A1D18;
+    --shadow:      0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.28);
+    --shadow-hover: 0 2px 6px rgba(0,0,0,.38), 0 18px 34px rgba(0,0,0,.34);
+  }
+
+  * { box-sizing: border-box; }
+  html { background: var(--ground); }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+    font-size: 15px; line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    border-top: 3px solid var(--accent);
+  }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 30px 24px 72px; }
+
+  /* ---------- masthead ---------- */
+  .mast { display: flex; flex-wrap: wrap; align-items: flex-end;
+          justify-content: space-between; gap: 16px;
+          padding-bottom: 16px; border-bottom: 1px solid var(--line); position: relative; }
+  .mast::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px;
+                 height: 2px; width: 64px; background: var(--accent); }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .mark { flex: none; display: block; border-radius: 9px; }
+  h1 { font-family: 'Source Serif 4', Georgia, serif; font-weight: 700;
+       font-size: clamp(28px, 4vw, 40px); line-height: 1.1; margin: 0;
+       letter-spacing: -.01em; text-wrap: balance; }
+  .mast .sub { color: var(--ink-soft); font-size: 13.5px; margin-top: 5px; }
+  .runstamp { font-family: 'IBM Plex Mono', monospace; font-size: 11.5px;
+              color: var(--ink-soft); text-align: right; white-space: nowrap;
+              padding: 5px 11px; border-radius: 999px; background: var(--surface-sub);
+              border: 1px solid var(--line-soft); }
+
+  /* ---------- summary tiles ---------- */
+  .tiles { display: grid; gap: 12px; margin: 22px 0 8px;
+           grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  .tile { display: flex; gap: 12px; align-items: flex-start;
+          background: var(--surface); border: 1px solid var(--line-soft);
+          border-radius: 6px; padding: 14px 16px; box-shadow: var(--shadow); }
+  .tile .icon { flex: none; width: 30px; height: 30px; border-radius: 7px;
+                display: flex; align-items: center; justify-content: center;
+                background: var(--accent-soft); color: var(--accent); }
+  .tile .icon svg { width: 17px; height: 17px; }
+  .tile .k { font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase;
+             color: var(--ink-faint); font-weight: 600; }
+  .tile .v { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums;
+             font-size: 25px; font-weight: 600; margin-top: 5px; line-height: 1.1; }
+  .tile .n { font-size: 12px; color: var(--ink-soft); margin-top: 3px; }
+  .tile.alert { border-color: var(--warn); background: var(--warn-bg); }
+  .tile.alert .v { color: var(--warn); }
+  .tile.alert .icon { background: rgba(0,0,0,.06); color: var(--warn); }
+
+  /* ---------- controls ---------- */
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+              margin: 22px 0 18px; padding: 12px; background: var(--surface-sub);
+              border: 1px solid var(--line-soft); border-radius: 4px; }
+  input[type=search], select {
+    font: inherit; font-size: 14px; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--line); border-radius: 3px; padding: 8px 10px; }
+  input[type=search] { flex: 1 1 240px; min-width: 180px; }
+  .chk { display: inline-flex; align-items: center; gap: 7px; font-size: 13.5px;
+         color: var(--ink-soft); cursor: pointer; user-select: none; }
+  .chk input { accent-color: var(--accent); width: 15px; height: 15px; }
+  :is(input, select, summary, button):focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px; }
+  .count { margin-left: auto; font-size: 12.5px; color: var(--ink-faint);
+           font-family: 'IBM Plex Mono', monospace; }
+
+  /* ---------- tender cards ---------- */
+  .cards { display: grid; gap: 16px;
+           grid-template-columns: repeat(auto-fit, minmax(500px, 1fr)); }
+  .card { background: var(--surface); border: 1px solid var(--line-soft);
+          border-left: 4px solid var(--ink-faint); border-radius: 6px;
+          box-shadow: var(--shadow); overflow: hidden; display: flex;
+          flex-direction: column; min-width: 0;
+          animation: cardIn .28s ease both;
+          transition: transform .15s ease, box-shadow .15s ease; }
+  .card:hover { transform: translateY(-2px); box-shadow: var(--shadow-hover); }
+  @keyframes cardIn { from { opacity: 0; transform: translateY(7px); }
+                      to { opacity: 1; transform: none; } }
+  .card.urgent { border-left-color: var(--crit); }
+  .card.soon   { border-left-color: var(--warn); }
+  .card.open   { border-left-color: var(--ok); }
+  .card.past   { border-left-color: var(--ink-faint); opacity: .72; }
+
+  .chead { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start;
+           padding: 16px 18px 12px; border-bottom: 1px solid var(--line-soft); }
+  .chead .id { font-family: 'IBM Plex Mono', monospace; font-size: 11.5px;
+               color: var(--ink-faint); letter-spacing: .04em; }
+  .chead h2 { font-family: 'Source Serif 4', Georgia, serif; font-size: 19px;
+              font-weight: 600; margin: 3px 0 0; line-height: 1.28;
+              text-wrap: balance; }
+  .chead .grow { flex: 1 1 320px; min-width: 0; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip { font-size: 11.5px; padding: 3px 9px; border-radius: 999px;
+          background: var(--accent-soft); color: var(--accent); font-weight: 600;
+          border: 1px solid transparent; }
+  .chip.plain { background: transparent; border-color: var(--line);
+                color: var(--ink-soft); font-weight: 500; }
+  .due { text-align: right; flex: 0 0 auto; }
+  .due .d { font-family: 'IBM Plex Mono', monospace; font-size: 14.5px;
+            font-weight: 600; font-variant-numeric: tabular-nums; }
+  .pill { display: inline-block; margin-top: 5px; font-size: 11.5px;
+          font-weight: 600; padding: 3px 10px; border-radius: 999px;
+          border: 1px solid currentColor; }
+  .pill.urgent { color: var(--crit); background: var(--crit-bg); }
+  .pill.soon   { color: var(--warn); background: var(--warn-bg); }
+  .pill.open   { color: var(--ok); }
+  .pill.past   { color: var(--ink-faint); }
+
+  /* ---------- money strip ---------- */
+  .money { display: grid; gap: 1px; background: var(--line-soft);
+           grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  .cell { background: var(--surface); padding: 11px 14px; }
+  .cell .k { font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+             color: var(--ink-faint); font-weight: 600; }
+  .cell .v { font-family: 'IBM Plex Mono', monospace; font-size: 14.5px;
+             font-variant-numeric: tabular-nums; margin-top: 4px;
+             word-break: break-word; }
+  .cell.flagged { background: var(--warn-bg); }
+  .cell.missing .v { color: var(--ink-faint); font-style: italic;
+                     font-family: 'IBM Plex Sans', sans-serif; font-size: 13px; }
+  .mark { font-size: 11px; font-weight: 700; color: var(--warn);
+          cursor: help; margin-left: 4px; }
+
+  /* ---------- meta + detail ---------- */
+  .meta { display: grid; gap: 10px 22px; padding: 13px 18px;
+          border-top: 1px solid var(--line-soft);
+          grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .meta .k { font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+             color: var(--ink-faint); font-weight: 600; }
+  .meta .v { font-size: 13.5px; margin-top: 2px; }
+  details { border-top: 1px solid var(--line-soft); }
+  summary { cursor: pointer; padding: 10px 18px; font-size: 13px; font-weight: 600;
+            color: var(--accent); list-style: none; display: flex; gap: 8px;
+            align-items: center; }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: '+'; font-family: 'IBM Plex Mono', monospace;
+                    font-weight: 600; width: 12px; }
+  details[open] summary::before { content: '\\2212'; }
+  .body { padding: 2px 18px 16px; font-size: 13.5px; color: var(--ink-soft);
+          white-space: pre-wrap; max-height: 340px; overflow-y: auto;
+          border-left: 2px solid var(--accent-soft); margin: 0 18px 14px; }
+  .src { font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+         color: var(--ink-faint); padding: 0 18px 12px; }
+
+  .empty { padding: 40px; text-align: center; color: var(--ink-faint);
+           background: var(--surface); border: 1px dashed var(--line);
+           border-radius: 4px; }
+  .note { margin: 20px 0 0; padding: 13px 16px; border-radius: 4px;
+          background: var(--surface); border: 1px solid var(--line-soft);
+          font-size: 13px; color: var(--ink-soft); }
+  .note b { color: var(--ink); }
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 10px;
+            font-size: 12.5px; color: var(--ink-soft); }
+  .sw { display: inline-block; width: 11px; height: 11px; border-radius: 2px;
+        margin-right: 6px; vertical-align: -1px; }
+  footer { margin-top: 34px; padding-top: 14px; border-top: 1px solid var(--line);
+           font-size: 12px; color: var(--ink-faint); }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+  @media print {
+    body { background: #fff; } .controls, footer { display: none; }
+    .card { break-inside: avoid; box-shadow: none; }
+    details { display: block; } .body { max-height: none; }
+  }
+</style>
+"""
+
+DASH_BODY = """
+<div class="wrap">
+  <header class="mast">
+    <div class="brand">
+      <svg class="mark" width="42" height="42" viewBox="0 0 42 42" aria-hidden="true">
+        <rect width="42" height="42" rx="9" fill="var(--accent)"/>
+        <text x="21" y="24" text-anchor="middle" font-family="'Source Serif 4', Georgia, serif"
+              font-size="17" font-weight="700" fill="var(--surface)">TP</text>
+      </svg>
+      <div>
+        <h1>Tender Pipeline</h1>
+        <div class="sub">__SUBTITLE__</div>
+      </div>
+    </div>
+    <div class="runstamp">__STAMP__</div>
+  </header>
+
+  <section class="tiles" id="tiles"></section>
+
+  <div class="controls">
+    <input type="search" id="q" placeholder="Search tender, place, scope, audit type&hellip;"
+           aria-label="Search tenders">
+    <label class="chk"><input type="checkbox" id="fRev"> Needs review</label>
+    <label class="chk"><input type="checkbox" id="fSoon"> Closing in 14 days</label>
+    <select id="sort" aria-label="Sort tenders">
+      <option value="due">Sort: deadline first</option>
+      <option value="folder">Sort: folder number</option>
+      <option value="emd">Sort: EMD highest</option>
+      <option value="review">Sort: most to review</option>
+    </select>
+    <span class="count" id="count"></span>
+  </div>
+
+  <main class="cards" id="cards"></main>
+
+  <div class="note">
+    <b>How to read this.</b> Every figure carries the file and page it came from &mdash;
+    open <em>Where each value came from</em> on any card to check it against the
+    document. Amber means the two readers disagreed, confidence was low, or the
+    value came off a scanned page. This removes the typing, not the review:
+    confirm EMD, fees and the deadline before you act on them.
+    <div class="legend">
+      <span><span class="sw" style="background:var(--crit)"></span>Closes within 3 days</span>
+      <span><span class="sw" style="background:var(--warn)"></span>Closes within 14 days</span>
+      <span><span class="sw" style="background:var(--ok)"></span>Open</span>
+      <span><span class="sw" style="background:var(--ink-faint)"></span>Closed or no date found</span>
+    </div>
+  </div>
+
+  <footer>__FOOTER__</footer>
+</div>
+
+<script>
+const DATA = __DATA__;
+const MONEY = ["emd","sd","tender_fees","estimated_cost","assignment_fees"];
+const MONEY_LABEL = {emd:"Tender EMD", sd:"Tender SD", tender_fees:"Tender fees",
+  estimated_cost:"Estimated cost", assignment_fees:"Assignment fees"};
+const PROSE = [["scope_of_work","Scope of work"],["eligibility","Eligibility criteria"],
+  ["penalty","Penalty"]];
+const MISSING = /^NOT FOUND/i;
+
+const esc = s => String(s==null?"":s).replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const has = f => f && f.value && !MISSING.test(f.value);
+
+function parseDue(s){
+  if(!s) return null;
+  let m = s.match(/(\\d{1,2})[-\\/.](\\d{1,2})[-\\/.](\\d{2,4})/);
+  if(m){ let y=+m[3]; if(y<100) y+=2000; return new Date(y, +m[2]-1, +m[1]); }
+  m = s.match(/(\\d{1,2})\\s+([A-Za-z]{3,})\\s+(\\d{4})/);
+  if(m){ const d=new Date(m[2]+" "+m[1]+", "+m[3]); return isNaN(d)?null:d; }
+  return null;
+}
+function toNum(s){
+  if(!s) return 0;
+  const m = String(s).replace(/,/g,"").match(/(\\d+(?:\\.\\d+)?)/);
+  if(!m) return 0;
+  let v = parseFloat(m[1]);
+  const tail = String(s).slice(String(s).indexOf(m[1])+m[1].length, 40).toLowerCase();
+  if(/^\\s*(?:\\/-)?\\s*crore/.test(tail)) v*=1e7;
+  else if(/^\\s*(?:\\/-)?\\s*(?:lakh|lac)/.test(tail)) v*=1e5;
+  return v;
+}
+const DAY = 864e5;
+const today = new Date(); today.setHours(0,0,0,0);
+function daysLeft(t){
+  const d = parseDue(t.fields.submission_date && t.fields.submission_date.value);
+  return d ? Math.round((d - today)/DAY) : null;
+}
+function state(n){
+  if(n===null) return "past";
+  if(n < 0) return "past";
+  if(n <= 3) return "urgent";
+  if(n <= 14) return "soon";
+  return "open";
+}
+function reviewCount(t){
+  return Object.values(t.fields).filter(f => f.flag).length;
+}
+const fmtINR = v => v >= 1e7 ? "Rs " + (v/1e7).toFixed(2) + " cr"
+                  : v >= 1e5 ? "Rs " + (v/1e5).toFixed(2) + " lakh"
+                  : "Rs " + v.toLocaleString("en-IN");
+
+DATA.forEach(t => {
+  t._days = daysLeft(t); t._state = state(t._days);
+  t._rev = reviewCount(t); t._emd = toNum(has(t.fields.emd) ? t.fields.emd.value : "");
+  t._hay = Object.values(t.fields).map(f => f.value).join(" ").toLowerCase()
+           + " " + t.folder.toLowerCase();
+});
+
+const ICONS = {
+  stack: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="12" height="14" rx="1.5"/><line x1="7" y1="7" x2="13" y2="7"/><line x1="7" y1="10.5" x2="13" y2="10.5"/><line x1="7" y1="14" x2="11" y2="14"/></svg>',
+  calendar: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="14" height="12" rx="1.5"/><line x1="3" y1="8" x2="17" y2="8"/><line x1="6.5" y1="3" x2="6.5" y2="6"/><line x1="13.5" y1="3" x2="13.5" y2="6"/><circle cx="10" cy="12.2" r="1.3" fill="currentColor" stroke="none"/></svg>',
+  rupee: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="10" cy="10" r="7.2"/><text x="10" y="14" text-anchor="middle" font-size="9.5" font-weight="700" fill="currentColor" stroke="none" font-family="inherit">\\u20b9</text></svg>',
+  flag: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polygon points="10,3 17.5,15.5 2.5,15.5"/><line x1="10" y1="8" x2="10" y2="11.3"/><circle cx="10" cy="13.4" r=".9" fill="currentColor" stroke="none"/></svg>',
+};
+
+function tiles(list){
+  const live = list.filter(t => t._days !== null && t._days >= 0);
+  const next = live.slice().sort((a,b) => a._days - b._days)[0];
+  const emd = list.reduce((s,t) => s + t._emd, 0);
+  const rev = list.reduce((s,t) => s + t._rev, 0);
+  const nodoc = list.filter(t => Object.values(t.fields).every(f => !has(f))).length;
+  const t = [
+    ["stack", "Tenders", list.length, list.length === 1 ? "in this run" : "folders read"],
+    ["calendar", "Next deadline", next ? next._days + (next._days === 1 ? " day" : " days")
+      : "\\u2014", next ? next.folder : "none still open", next && next._days <= 3],
+    ["rupee", "EMD at stake", emd ? fmtINR(emd) : "\\u2014", "total across open tenders"],
+    ["flag", "Fields to verify", rev, "amber or red cells", rev > 0],
+  ];
+  if (nodoc) t.push(["flag", "No documents", nodoc, "folder(s) with nothing readable", true]);
+  document.getElementById("tiles").innerHTML = t.map(([icon,k,v,n,a]) =>
+    `<div class="tile${a ? " alert" : ""}"><div class="icon">${ICONS[icon]}</div>
+     <div><div class="k">${esc(k)}</div>
+     <div class="v">${esc(v)}</div><div class="n">${esc(n)}</div></div></div>`).join("");
+}
+
+function cell(t, key){
+  const f = t.fields[key] || {};
+  const ok = has(f);
+  const cls = !ok ? "cell missing" : (f.flag ? "cell flagged" : "cell");
+  const mark = f.flag ? `<span class="mark" title="${esc(f.flag)}">&#9888;</span>` : "";
+  return `<div class="${cls}"><div class="k">${esc(MONEY_LABEL[key])}</div>
+    <div class="v">${ok ? esc(f.value) : "not stated"}${mark}</div></div>`;
+}
+
+function card(t){
+  const f = t.fields;
+  const dueTxt = has(f.submission_date) ? f.submission_date.value : "no date found";
+  const pill = t._days === null ? "no deadline read"
+    : t._days < 0 ? "closed" : t._days === 0 ? "closes today"
+    : t._days + (t._days === 1 ? " day left" : " days left");
+  const chips = [];
+  if (has(f.purpose)) chips.push(`<span class="chip">${esc(f.purpose.value.slice(0,90))}</span>`);
+  if (has(f.period)) chips.push(`<span class="chip plain">Period: ${esc(f.period.value.slice(0,80))}</span>`);
+  if (t._rev) chips.push(`<span class="chip plain">${t._rev} to verify</span>`);
+
+  const prose = PROSE.filter(([k]) => has(f[k])).map(([k,lab]) =>
+    `<details><summary>${esc(lab)}</summary>
+      <div class="body">${esc(f[k].value)}</div>
+      <div class="src">Source: ${esc(f[k].ref || "\\u2014")}</div></details>`).join("");
+
+  const refs = Object.entries(f).map(([k,v]) =>
+      has(v) ? `${esc(v.label)} &rarr; ${esc(v.ref || "no page recorded")}${
+        v.flag ? ` <b>(${esc(v.flag)})</b>` : ""}` : null)
+    .filter(Boolean).join("<br>");
+  const docs = (t.files || []).map(d =>
+    `${esc(d.name)} &mdash; ${d.pages} page(s)${d.ocr ? `, ${d.ocr} via OCR` : ""}${
+      d.note ? ` <i>(${esc(d.note)})</i>` : ""}`).join("<br>");
+
+  return `<article class="card ${t._state}">
+    <div class="chead">
+      <div class="grow">
+        <div class="id">${esc(t.folder)}</div>
+        <h2>${esc(has(f.tender_name) ? f.tender_name.value : t.folder)}</h2>
+        <div class="chips">${chips.join("")}</div>
+      </div>
+      <div class="due">
+        <div class="d">${esc(dueTxt)}</div>
+        <span class="pill ${t._state}">${esc(pill)}</span>
+      </div>
+    </div>
+    <div class="money">${MONEY.map(k => cell(t,k)).join("")}</div>
+    <div class="meta">
+      <div><div class="k">Location / address</div>
+        <div class="v">${has(f.location) ? esc(f.location.value) : "<i>not stated</i>"}</div></div>
+      <div><div class="k">Period</div>
+        <div class="v">${has(f.period) ? esc(f.period.value) : "<i>not stated</i>"}</div></div>
+    </div>
+    ${prose}
+    <details><summary>Where each value came from</summary>
+      <div class="body">${refs || "nothing extracted"}</div></details>
+    <details><summary>Documents read (${(t.files || []).length})</summary>
+      <div class="body">${docs || "none"}</div></details>
+  </article>`;
+}
+
+function render(){
+  const q = document.getElementById("q").value.trim().toLowerCase();
+  const rev = document.getElementById("fRev").checked;
+  const soon = document.getElementById("fSoon").checked;
+  const sort = document.getElementById("sort").value;
+  let list = DATA.filter(t => (!q || t._hay.includes(q))
+    && (!rev || t._rev > 0)
+    && (!soon || (t._days !== null && t._days >= 0 && t._days <= 14)));
+  const rank = {urgent:0, soon:1, open:2, past:3};
+  list.sort((a,b) => sort === "folder" ? a.folder.localeCompare(b.folder)
+    : sort === "emd" ? b._emd - a._emd
+    : sort === "review" ? b._rev - a._rev
+    : (rank[a._state] - rank[b._state]) || ((a._days ?? 1e9) - (b._days ?? 1e9)));
+  document.getElementById("cards").innerHTML = list.length
+    ? list.map(card).join("")
+    : `<div class="empty">No tender matches that filter.</div>`;
+  document.getElementById("count").textContent =
+    list.length + " of " + DATA.length + " shown";
+  tiles(DATA);
+}
+["q","fRev","fSoon","sort"].forEach(id =>
+  document.getElementById(id).addEventListener("input", render));
+render();
+
+// Lets a host page embedding this as an iframe (e.g. the Colab notebook)
+// resize the frame to fit, instead of showing a nested scrollbar. Harmless
+// when opened as a plain file - there is simply no parent listening.
+(function () {
+  function report() {
+    try { parent.postMessage({ tenderDashHeight: document.body.scrollHeight }, "*"); }
+    catch (e) {}
+  }
+  window.addEventListener("resize", report);
+  new MutationObserver(report).observe(document.body, {
+    childList: true, subtree: true, attributes: true });
+  report();
+  setTimeout(report, 300);
+})();
+</script>
+"""
+
+
+def build_dashboard_html(rows: list, standalone: bool = True,
+                         subtitle: str = "", stamp: str = "",
+                         footer: str = "") -> str:
+    """Render the tender rows as a self-contained HTML dashboard."""
+    data = []
+    for row in rows:
+        res = row["results"]
+        data.append({
+            "folder": row["tender"],
+            "files": row.get("files", []),
+            "fields": {
+                key: {"label": label, "value": r.value, "ref": r.ref,
+                      "conf": r.conf, "flag": r.flag}
+                for (key, label), r in ((kl, res[kl[0]]) for kl in FIELDS)
+            },
+        })
+    body = (DASH_BODY
+            .replace("__DATA__", json.dumps(data, ensure_ascii=False))
+            .replace("__SUBTITLE__", subtitle or
+                     f"{len(rows)} tender folders &middot; 13 fields each "
+                     f"&middot; every figure traceable to a page")
+            .replace("__STAMP__", stamp)
+            .replace("__FOOTER__", footer or
+                     "Generated by the tender extractor. Values are read from the "
+                     "tender documents themselves; always verify before bidding."))
+    head = "<title>Tender Pipeline</title>" + DASH_STYLE
+    if not standalone:
+        return head + body
+    return ('<!doctype html>\n<html lang="en">\n<head>\n'
+            '<meta charset="utf-8">\n'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+            + head + "\n</head>\n<body>\n" + body + "\n</body>\n</html>\n")
+
+
+def write_dashboard(rows: list, out_path: Path, stamp: str = "") -> Path:
+    flagged = sum(1 for r in rows for k, _ in FIELDS if r["results"][k].flag)
+    footer = (f"{len(rows)} tenders &middot; {flagged} field(s) flagged for review "
+              f"&middot; open the Excel for the full table")
+    html = build_dashboard_html(rows, standalone=True, stamp=stamp, footer=footer)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html, encoding="utf-8")
+    return out_path
+
+
+if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Extract tender summaries.")
+    ap.add_argument("--drive", help="Google Drive folder link (shared, viewer)")
+    ap.add_argument("--folder", help="Local folder of tender sub-folders")
+    ap.add_argument("--out", default="Tender_Summary.xlsx")
+    ap.add_argument("--html", default="Tender_Dashboard.html")
+    ap.add_argument("--key", default="", help="Gemini API key (optional)")
+    ap.add_argument("--no-ai", action="store_true", help="rules only")
+    ap.add_argument("--no-cache", action="store_true")
+    a = ap.parse_args()
+
+    if a.folder:
+        CONFIG["source_mode"] = "local_folder"
+        CONFIG["local_folder"] = a.folder
+    elif a.drive:
+        CONFIG["source_mode"] = "drive_link"
+        CONFIG["drive_folder_url"] = a.drive
+    CONFIG["output_xlsx"] = a.out
+    CONFIG["output_html"] = a.html
+    CONFIG["gemini_api_key"] = a.key or os.environ.get("GEMINI_API_KEY", "")
+    CONFIG["use_gemini"] = not a.no_ai
+    CONFIG["use_cache"] = not a.no_cache
+    run()
