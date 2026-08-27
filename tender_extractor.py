@@ -1820,6 +1820,14 @@ def process_tender(name: str, files: list[Path], client, models) -> dict:
     log(f"   {len(pages)} page(s), {total_chars:,} characters of text")
     rules = rules_extract(pages, name)
     ai, ai_ok = ai_extract(pages, client, models)
+    # A key was supplied but no model could be reached: that is a transient
+    # outage, not a finished answer. Marking it as such keeps the result out
+    # of the cache, so the next run retries instead of freezing the weaker
+    # rules-only reading in place forever.
+    _key_supplied = bool((CONFIG.get("gemini_api_key")
+                          or os.environ.get("GEMINI_API_KEY") or "").strip())
+    if CONFIG.get("use_gemini") and _key_supplied and not client:
+        ai_ok = False
     results = merge(rules, ai, ai_ran=bool(client) and ai_ok)
     found = sum(1 for k, _ in FIELDS if results[k].value != NOT_FOUND)
     note = ""
@@ -1832,14 +1840,30 @@ def process_tender(name: str, files: list[Path], client, models) -> dict:
             "ai_ok": ai_ok}
 
 
-# Bumped when extraction logic changes, so stale caches from an older, weaker
-# version of the engine are ignored instead of silently reused.
-CACHE_VERSION = "v3"
+# Stale caches from an older, weaker engine must never be silently reused.
+# This used to be a hand-bumped constant, which is a trap: change the
+# extraction logic, forget the bump, and every tender replays yesterday's
+# wrong answers in six seconds while looking like a successful run. The
+# engine's own source is hashed instead, so any edit to the extraction logic
+# invalidates the cache automatically.
+CACHE_VERSION = "v4"
+
+
+def _engine_fingerprint() -> str:
+    try:
+        src = Path(__file__).read_bytes()
+        return CACHE_VERSION + "-" + hashlib.md5(src).hexdigest()[:8]
+    except Exception:
+        # Embedded/exec'd copies have no __file__; fall back to the constant.
+        return CACHE_VERSION
+
+
+ENGINE_FP = _engine_fingerprint()
 
 
 def _cache_path(work: Path, name: str, h: str) -> Path:
     safe = re.sub(r"[^\w.-]", "_", name)
-    return work / "cache" / f"{safe}__{CACHE_VERSION}_{h}.json"
+    return work / "cache" / f"{safe}__{ENGINE_FP}_{h}.json"
 
 
 def _to_json(row: dict) -> str:
