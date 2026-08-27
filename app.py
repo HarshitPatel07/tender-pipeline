@@ -22,6 +22,49 @@ st.set_page_config(page_title="Tender Pipeline", page_icon="🧾", layout="cente
 if "result" not in st.session_state:
     st.session_state.result = None  # (dash_html, excel_bytes, log_text) | None
 
+
+class LiveLog(io.TextIOBase):
+    """Mirrors the engine's print() output into the page while it runs.
+
+    Without this the whole run is invisible behind a spinner: the engine can
+    spend several minutes downloading, OCR-ing and calling Gemini, and a
+    silent spinner is indistinguishable from a hang. Renders are throttled so
+    a chatty engine does not flood the websocket.
+    """
+
+    MAX_LINES = 16
+    MIN_INTERVAL = 0.35  # seconds between re-renders
+
+    def __init__(self, placeholder):
+        self.placeholder = placeholder
+        self.lines: list[str] = []
+        self._partial = ""
+        self._last_render = 0.0
+
+    def write(self, s):
+        self._partial += s
+        while "\n" in self._partial:
+            line, self._partial = self._partial.split("\n", 1)
+            self.lines.append(line)
+        now = time.monotonic()
+        if now - self._last_render >= self.MIN_INTERVAL:
+            self._last_render = now
+            self._render()
+        return len(s)
+
+    def flush(self):
+        self._render()
+
+    def _render(self):
+        tail = [ln for ln in self.lines[-self.MAX_LINES:]]
+        if self._partial:
+            tail.append(self._partial)
+        self.placeholder.code("\n".join(tail) or "Starting...", language=None)
+
+    def getvalue(self):
+        return "\n".join(self.lines)
+
+
 st.title("Tender Pipeline")
 st.markdown(
     "Paste your tender folder's Google Drive link below, press **Extract "
@@ -41,6 +84,11 @@ drive_link = st.text_input(
 gemini_key = st.text_input(
     "Gemini API key (optional — free at aistudio.google.com/apikey)",
     type="password", placeholder="Leave blank to run without AI")
+st.caption(
+    "With a key the freeform documents read much better, but the run takes "
+    "noticeably longer. Without one it still reads GeM bids well. Either way "
+    "the live progress below tells you exactly what it is doing."
+)
 
 go = st.button("Extract tenders", type="primary")
 
@@ -61,26 +109,42 @@ if go:
             "use_gemini": bool(gemini_key.strip()),
             "work_dir": "tender_work",
             "use_cache": True,
+            # --- tuned down for a free shared cloud container ---------------
+            # 300 dpi pixmaps are memory-hungry and this tier has little RAM;
+            # 200 dpi still reads printed tender scans well.
+            "ocr_dpi": 200,
+            "ocr_max_pages_per_file": 25,
+            # Fail fast rather than appear frozen. The engine's own backoff
+            # can otherwise wait minutes per busy model, and on a web page a
+            # long silence reads as a crash.
+            "gemini_retries": 3,
         })
-        log = io.StringIO()
-        with st.spinner("Reading your tender documents — this can take a "
-                        "few minutes for a large folder or scanned PDFs..."):
-            try:
-                with contextlib.redirect_stdout(log):
+
+        st.info("Working. This normally takes a few minutes — longer with a "
+                "Gemini key or scanned PDFs. You can leave this tab open.")
+        progress_box = st.empty()
+        live = LiveLog(progress_box)
+
+        try:
+            with st.spinner("Reading your tender documents..."):
+                with contextlib.redirect_stdout(live):
                     te.run()
-            except Exception as e:
-                st.session_state.result = None
-                st.error(f"Something went wrong: {e}")
-                with st.expander("Technical log"):
-                    st.code(log.getvalue() or "(no output captured)")
-                st.stop()
+            live.flush()
+        except Exception as e:
+            live.flush()
+            st.session_state.result = None
+            st.error(f"Something went wrong: {e}")
+            with st.expander("Technical log", expanded=True):
+                st.code(live.getvalue() or "(no output captured)")
+            st.stop()
 
         dash_html = te.build_dashboard_html(
             te.LAST_ROWS, standalone=True,
             stamp="Run " + time.strftime("%d %b %Y, %H:%M"))
         excel_path = Path("Tender_Summary.xlsx")
         excel_bytes = excel_path.read_bytes() if excel_path.exists() else None
-        st.session_state.result = (dash_html, excel_bytes, log.getvalue())
+        st.session_state.result = (dash_html, excel_bytes, live.getvalue())
+        progress_box.empty()
 
 if st.session_state.result:
     dash_html, excel_bytes, log_text = st.session_state.result
