@@ -1156,15 +1156,21 @@ tender_fees, submission_date
 
 def _gemini_client():
     try:
-        import google.generativeai as genai
-    except Exception as e:
-        log(f"   ! google.generativeai not installed ({e}); running rules-only")
-        return None, None
+        import google.genai as genai
+    except ImportError:
+        try:
+            import google.generativeai as genai
+        except Exception as e:
+            log(f"   ! Gemini SDK not installed ({e}); running rules-only")
+            return None, None
     key = (CONFIG.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or "").strip()
     if not key:
         log("   ! no Gemini API key set; running rules-only")
         return None, None
-    genai.configure(api_key=key)
+    if hasattr(genai, 'configure'):
+        genai.configure(api_key=key)
+    else:
+        genai.api_key = key
     client = genai
 
     # List all available models and pick one that works
