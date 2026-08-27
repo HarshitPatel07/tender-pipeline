@@ -12,6 +12,7 @@ import contextlib
 import io
 import time
 from pathlib import Path
+import re
 
 import streamlit as st
 
@@ -23,31 +24,34 @@ if "result" not in st.session_state:
     st.session_state.result = None  # (dash_html, excel_bytes, log_text) | None
 
 
-class LiveLog(io.TextIOBase):
-    """Mirrors the engine's print() output into the page while it runs.
+class ProgressLog(io.TextIOBase):
+    """Streams engine output with structured progress tracking.
 
-    Without this the whole run is invisible behind a spinner: the engine can
-    spend several minutes downloading, OCR-ing and calling Gemini, and a
-    silent spinner is indistinguishable from a hang. Renders are throttled so
-    a chatty engine does not flood the websocket.
+    Parses key milestones (downloading, reading PDFs, OCR, AI extraction)
+    and displays progress bars with timing and current file info.
     """
 
-    MAX_LINES = 16
-    MIN_INTERVAL = 0.35  # seconds between re-renders
-
-    def __init__(self, placeholder):
-        self.placeholder = placeholder
+    def __init__(self, progress_container, log_container):
+        self.progress_container = progress_container
+        self.log_container = log_container
         self.lines: list[str] = []
         self._partial = ""
         self._last_render = 0.0
+        self.start_time = time.monotonic()
+        self.current_file = None
+        self.current_step = "Starting..."
+        self.files_done = 0
+        self.total_files = None
 
     def write(self, s):
         self._partial += s
         while "\n" in self._partial:
             line, self._partial = self._partial.split("\n", 1)
             self.lines.append(line)
+            self._parse_line(line)
+
         now = time.monotonic()
-        if now - self._last_render >= self.MIN_INTERVAL:
+        if now - self._last_render >= 0.5:
             self._last_render = now
             self._render()
         return len(s)
@@ -55,11 +59,67 @@ class LiveLog(io.TextIOBase):
     def flush(self):
         self._render()
 
+    def _parse_line(self, line):
+        """Extract progress info from engine output lines."""
+        # Detect which file is being processed
+        if "Reading" in line and ".pdf" in line.lower():
+            match = re.search(r"Reading\s+([^.]+\.pdf)", line, re.IGNORECASE)
+            if match:
+                self.current_file = match.group(1)
+                self.current_step = "📄 Reading PDF"
+        elif "reading" in line.lower() and "docx" in line.lower():
+            match = re.search(r"([^\s]+\.docx)", line, re.IGNORECASE)
+            if match:
+                self.current_file = match.group(1)
+                self.current_step = "📄 Reading DOCX"
+        elif "reading" in line.lower() and ("xls" in line.lower() or "excel" in line.lower()):
+            match = re.search(r"([^\s]+\.xls[x]?)", line, re.IGNORECASE)
+            if match:
+                self.current_file = match.group(1)
+                self.current_step = "📊 Reading Excel"
+        elif "ocr" in line.lower() or "tesseract" in line.lower():
+            self.current_step = "🔍 OCR scanning"
+        elif "gemini" in line.lower() or "ai" in line.lower():
+            self.current_step = "🤖 AI extraction"
+        elif "merge" in line.lower() or "comparing" in line.lower():
+            self.current_step = "✓ Verifying data"
+        elif "cached" in line.lower():
+            self.current_step = "💾 Using cache"
+
+        # Track tender count
+        if "tender" in line.lower() and "total" in line.lower():
+            match = re.search(r"(\d+)\s+tender", line, re.IGNORECASE)
+            if match:
+                self.total_files = int(match.group(1))
+
+        # Track completion
+        if "writing" in line.lower() and ("excel" in line.lower() or "xlsx" in line.lower()):
+            self.files_done = self.total_files or self.files_done + 1
+
     def _render(self):
-        tail = [ln for ln in self.lines[-self.MAX_LINES:]]
-        if self._partial:
-            tail.append(self._partial)
-        self.placeholder.code("\n".join(tail) or "Starting...", language=None)
+        """Display progress with bars, timing, and current file."""
+        elapsed = int(time.monotonic() - self.start_time)
+        elapsed_str = f"{elapsed//60}m {elapsed%60}s" if elapsed >= 60 else f"{elapsed}s"
+
+        with self.progress_container.container():
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown(f"**{self.current_step}**")
+                if self.current_file:
+                    st.caption(f"📁 {self.current_file}")
+            with col2:
+                st.caption(f"⏱️ {elapsed_str}")
+
+            # Progress bar if we know totals
+            if self.total_files and self.total_files > 0:
+                progress = min(self.files_done / self.total_files, 1.0)
+                st.progress(progress, text=f"{self.files_done}/{self.total_files} tenders")
+
+        # Recent log lines
+        with self.log_container.container():
+            tail = self.lines[-8:]
+            log_text = "\n".join(tail)
+            st.code(log_text or "Starting...", language=None)
 
     def getvalue(self):
         return "\n".join(self.lines)
@@ -109,33 +169,28 @@ if go:
             "use_gemini": bool(gemini_key.strip()),
             "work_dir": "tender_work",
             "use_cache": True,
-            # --- tuned down for a free shared cloud container ---------------
-            # 300 dpi pixmaps are memory-hungry and this tier has little RAM;
-            # 200 dpi still reads printed tender scans well.
             "ocr_dpi": 200,
             "ocr_max_pages_per_file": 25,
-            # Fail fast rather than appear frozen. The engine's own backoff
-            # can otherwise wait minutes per busy model, and on a web page a
-            # long silence reads as a crash.
             "gemini_retries": 3,
         })
 
         st.info("Working. This normally takes a few minutes — longer with a "
                 "Gemini key or scanned PDFs. You can leave this tab open.")
         progress_box = st.empty()
-        live = LiveLog(progress_box)
+        log_box = st.empty()
+        progress_log = ProgressLog(progress_box, log_box)
 
         try:
             with st.spinner("Reading your tender documents..."):
-                with contextlib.redirect_stdout(live):
+                with contextlib.redirect_stdout(progress_log):
                     te.run()
-            live.flush()
+            progress_log.flush()
         except Exception as e:
-            live.flush()
+            progress_log.flush()
             st.session_state.result = None
             st.error(f"Something went wrong: {e}")
             with st.expander("Technical log", expanded=True):
-                st.code(live.getvalue() or "(no output captured)")
+                st.code(progress_log.getvalue() or "(no output captured)")
             st.stop()
 
         dash_html = te.build_dashboard_html(
@@ -143,8 +198,9 @@ if go:
             stamp="Run " + time.strftime("%d %b %Y, %H:%M"))
         excel_path = Path("Tender_Summary.xlsx")
         excel_bytes = excel_path.read_bytes() if excel_path.exists() else None
-        st.session_state.result = (dash_html, excel_bytes, live.getvalue())
+        st.session_state.result = (dash_html, excel_bytes, progress_log.getvalue())
         progress_box.empty()
+        log_box.empty()
 
 if st.session_state.result:
     dash_html, excel_bytes, log_text = st.session_state.result
