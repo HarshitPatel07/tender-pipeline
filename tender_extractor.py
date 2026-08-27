@@ -1166,27 +1166,42 @@ def _gemini_client():
         return None, None
     genai.configure(api_key=key)
     client = genai
-    wanted = list(CONFIG["gemini_models"])
-    for i, model in enumerate(wanted):
+
+    # Auto-detect available models - try to list them, fallback to hardcoded list
+    tried_models = []
+    try:
+        # Try to list available models
+        available = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                model_name = m.name.replace('models/', '')
+                available.append(model_name)
+        if available:
+            tried_models = available[:5]  # Use top 5 available models
+            log(f"   Auto-detected {len(available)} Gemini models")
+        else:
+            tried_models = list(CONFIG["gemini_models"])
+    except Exception as e:
+        log(f"   Could not auto-detect models, using configured list: {str(e)[:60]}")
+        tried_models = list(CONFIG["gemini_models"])
+
+    # Try each model until one works
+    for i, model in enumerate(tried_models):
         try:
-            client.models.generate_content(model=model, contents="ping")
-            # Put the verified model first, keep the rest as live fallbacks.
-            models = [model] + [m for m in wanted if m != model]
-            log(f"   Gemini ready: {model}  (fallbacks: "
-                f"{', '.join(models[1:3])}, ...)")
+            response = genai.GenerativeModel(model).generate_content("test")
+            models = [model] + [m for m in tried_models if m != model]
+            log(f"   ✓ Gemini ready: {model}  (fallbacks: {', '.join(models[1:3] if len(models) > 1 else [])})")
             return client, models
         except Exception as e:
             msg = str(e)
             if _overloaded(msg):
-                # Busy right now, but valid - keep it as a fallback.
-                log(f"   - {model} is busy; will retry it later")
+                log(f"   - {model} busy; will retry later")
                 continue
-            log(f"   - {model} unavailable ({msg[:80]})")
-            wanted[i] = None
-    live = [m for m in wanted if m]
-    if live:
-        log(f"   Gemini models all busy at start; will keep trying: {live[0]}")
-        return client, live
+            if "401" in msg or "permission" in msg.lower():
+                log(f"   ! API key invalid or model access denied")
+                return None, None
+            log(f"   - {model} unavailable: {msg[:60]}")
+
     log("   ! no usable Gemini model; running rules-only")
     return None, None
 
