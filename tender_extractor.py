@@ -1167,42 +1167,37 @@ def _gemini_client():
     genai.configure(api_key=key)
     client = genai
 
-    # Auto-detect available models - try to list them, fallback to hardcoded list
+    # List all available models and pick one that works
     tried_models = []
     try:
-        # Try to list available models
-        available = []
         for m in genai.list_models():
             if 'generateContent' in m.supported_generation_methods:
                 model_name = m.name.replace('models/', '')
-                available.append(model_name)
-        if available:
-            tried_models = available[:5]  # Use top 5 available models
-            log(f"   Auto-detected {len(available)} Gemini models")
-        else:
-            tried_models = list(CONFIG["gemini_models"])
+                tried_models.append(model_name)
+                log(f"   - Available: {model_name}")
     except Exception as e:
-        log(f"   Could not auto-detect models, using configured list: {str(e)[:60]}")
-        tried_models = list(CONFIG["gemini_models"])
+        log(f"   Could not list models: {str(e)[:80]}")
 
-    # Try each model until one works
-    for i, model in enumerate(tried_models):
+    # Fallback to config list if auto-detect failed
+    if not tried_models:
+        tried_models = list(CONFIG.get("gemini_models", ["gemini-1.5-pro", "gemini-1.5-flash"]))
+        log(f"   Using fallback models: {tried_models}")
+
+    # Try each model
+    for model in tried_models:
         try:
-            response = genai.GenerativeModel(model).generate_content("test")
-            models = [model] + [m for m in tried_models if m != model]
-            log(f"   ✓ Gemini ready: {model}  (fallbacks: {', '.join(models[1:3] if len(models) > 1 else [])})")
-            return client, models
+            log(f"   Testing {model}...")
+            genai.GenerativeModel(model).generate_content(".")
+            log(f"   ✓ Gemini ready: {model}")
+            return client, [model] + [m for m in tried_models if m != model]
         except Exception as e:
             msg = str(e)
-            if _overloaded(msg):
-                log(f"   - {model} busy; will retry later")
-                continue
             if "401" in msg or "permission" in msg.lower():
-                log(f"   ! API key invalid or model access denied")
+                log(f"   ! API key error: {msg[:60]}")
                 return None, None
-            log(f"   - {model} unavailable: {msg[:60]}")
+            log(f"   ✗ {model}: {msg[:60]}")
 
-    log("   ! no usable Gemini model; running rules-only")
+    log("   ! no Gemini model available; running rules-only")
     return None, None
 
 
