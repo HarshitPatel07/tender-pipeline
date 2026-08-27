@@ -1036,6 +1036,139 @@ GEM_BID_NO_RE = re.compile(r"(GEM/\d{4}/[BR]/\d+)", re.I)
 EPBG_RE = re.compile(r"ePBG\s*Percentage\s*\(?%?\)?\s*[:\-]?\s*(\d+(?:\.\d+)?)", re.I)
 
 
+# --- Tender247 "AI Generated Tender Summary" sheets -----------------------
+#
+# Most folders ship one of these alongside the bid documents. It is a plain
+# two-column table that already states the cost, the EMD, the deadline, the
+# site and the eligibility - the very fields that are hardest to find in a
+# 500-page bid pack. Reading it directly is worth more than any amount of
+# regex tuning against the long documents.
+#
+# The labels wrap across lines in the extracted text ("Bid End Date\nTime
+# 25-08-2026"), so the page is flattened to one line before matching and
+# each value is taken as whatever sits between its label and the next one.
+
+SUMMARY_LABELS = [
+    "Tender Id", "GEM Bid number", "Bid End Date Time", "Bid Opening Date Time",
+    "Bid Offer Validity From EndDate", "Ministry State Name", "Department Name",
+    "Organisation Name", "Office Name", "Item Category", "Contract Period",
+    "Site location", "Bid to Ra Enabled", "Type of Bid",
+    "Time Allowed for Clarifications", "Evaluation Method",
+    "Emd Instrument Type", "Completion Period", "MSE Purchase Preference",
+    "Category", "Delivery district", "Location", "Products", "State",
+    "Estimated Cost", "EMD Value", "Emd Mode Type", "Mediation Clause",
+    "Arbitration Clause", "Document required from seller", "Pre Bid Meeting",
+    "Last date for Seeking Clarification", "Joint Venture OR Consortium OR JV",
+    "Work to be Done Site or Workshop", "Payment terms",
+    "Courier Speed Post Submission", "Mandatory Sample Submission",
+    "Organization Tender ID", "Scope Classification", "Eligibility Criteria",
+    "Checklist",
+]
+
+_SUMMARY_ALT = "|".join(
+    r"\s+".join(re.escape(w) for w in lab.split())
+    for lab in sorted(SUMMARY_LABELS, key=len, reverse=True)
+)
+SUMMARY_LABEL_RE = re.compile(rf"\b({_SUMMARY_ALT})\b", re.I)
+
+SUMMARY_MARKER_RE = re.compile(
+    r"AI\s+Generated\s+Tender\s+Summary|GEM\s+Bid\s+number", re.I)
+
+
+def _dedupe_repeat(s: str) -> str:
+    """Collapse "X X" into "X" - these cells repeat their own value."""
+    half = len(s) // 2
+    if half > 8 and s[:half].strip() == s[half:].strip():
+        return s[:half].strip()
+    return s
+
+
+def _summary_cells(pages: list[Page]) -> tuple[dict[str, str], str]:
+    """Return {label_lower: value} from the summary sheet, if there is one.
+
+    Qualification is per FILE, not per page: only the first page carries the
+    "AI Generated Tender Summary" banner, while the cost, the EMD and the
+    site sit on page 2. Matching per page would silently drop exactly the
+    fields the sheet is most useful for.
+    """
+    by_file: dict[str, list[Page]] = {}
+    for pg in _ordered_pages(pages):
+        by_file.setdefault(pg.file, []).append(pg)
+
+    cells: dict[str, str] = {}
+    ref = ""
+    for fname, fpages in by_file.items():
+        looks_like = ("tender-summary" in fname.lower()
+                      or "tender_summary" in fname.lower()
+                      or any(SUMMARY_MARKER_RE.search(p.text) for p in fpages))
+        if not looks_like:
+            continue
+        flat = re.sub(r"\s+", " ", "\n".join(p.text for p in fpages))
+        hits = list(SUMMARY_LABEL_RE.finditer(flat))
+        if len(hits) < 6:            # not really one of these sheets
+            continue
+        ref = ref or fpages[0].ref
+        for i, m in enumerate(hits):
+            end = hits[i + 1].start() if i + 1 < len(hits) else len(flat)
+            val = _dedupe_repeat(flat[m.end():end].strip(" :|-–"))
+            key = re.sub(r"\s+", " ", m.group(1)).strip().lower()
+            if val and key not in cells:
+                cells[key] = val
+    return cells, ref
+
+
+def _summary_money(val: str) -> str:
+    """Format a summary-sheet money cell, honouring an explicit nil."""
+    if EXPLICIT_NIL_RE.search(val):
+        m = EXPLICIT_NIL_RE.search(val)
+        return m.group(0).strip().title()
+    num, disp = parse_amount(val, allow_bare=True)
+    return disp or ""
+
+
+def summary_sheet_extract(pages: list[Page]) -> dict[str, Cand]:
+    cells, ref = _summary_cells(pages)
+    if not cells:
+        return {}
+
+    out: dict[str, Cand] = {}
+
+    def put(field: str, raw: str, conf: str = "high"):
+        raw = _clean(raw or "").strip()
+        if raw and not _is_junk_line(raw):
+            out[field] = Cand(raw, ref, conf)
+
+    for lab in ("estimated cost",):
+        if lab in cells:
+            put("estimated_cost", _summary_money(cells[lab]))
+    if "emd value" in cells:
+        put("emd", _summary_money(cells["emd value"]))
+    if "bid end date time" in cells:
+        put("submission_date", cells["bid end date time"])
+    for lab in ("contract period", "completion period"):
+        if lab in cells:
+            put("period", cells[lab])
+            break
+    for lab in ("site location", "location"):
+        if lab in cells:
+            put("location", cells[lab])
+            break
+    for lab in ("products", "item category"):
+        if lab in cells:
+            put("purpose", cells[lab])
+            break
+    if "eligibility criteria" in cells:
+        put("eligibility", cells["eligibility criteria"], "medium")
+    if "item category" in cells:
+        put("scope_of_work", cells["item category"], "medium")
+    if "gem bid number" in cells:
+        title = cells.get("item category", "")
+        tail = title.split(" - ")[-1].strip() if " - " in title else ""
+        name = cells["gem bid number"] + (f" - {tail}" if tail else "")
+        put("tender_name", name)
+    return out
+
+
 def rules_extract(pages: list[Page], folder_name: str) -> dict[str, Cand]:
     out: dict[str, Cand] = {}
 
@@ -1096,6 +1229,21 @@ def rules_extract(pages: list[Page], folder_name: str) -> dict[str, Cand]:
             out["sd"] = Cand(joined, pg.ref, "high")
             break
 
+    # The summary sheet is a structured table, so it outranks anything the
+    # regexes scraped out of running prose - except a high-confidence hit,
+    # which came off an equally explicit label in the tender itself. For the
+    # prose fields the long documents say far more, so only fill a gap there.
+    summary = summary_sheet_extract(pages)
+    if summary:
+        log(f"   read tender summary sheet ({len(summary)} field(s))")
+    for f, cand in summary.items():
+        cur = out.get(f) or Cand()
+        if f in ("eligibility", "scope_of_work", "penalty"):
+            if not cur.value:
+                out[f] = cand
+        elif not cur.value or cur.conf != "high":
+            out[f] = cand
+
     if not out["tender_name"].value:
         out["tender_name"] = Cand(folder_name, "folder name", "low")
     return out
@@ -1155,55 +1303,63 @@ tender_fees, submission_date
 
 
 def _gemini_client():
+    """Build a Gemini client and pick a model this key can actually use.
+
+    Rather than guessing model names (they change, and a wrong guess reads as
+    a 404 that looks like a broken key), ask the account what it has and take
+    the first flash-class model offered. The configured list is only a
+    fallback for when listing itself is unavailable.
+    """
     try:
-        import google.genai as genai
-    except ImportError:
-        try:
-            import google.generativeai as genai
-        except Exception as e:
-            log(f"   ! Gemini SDK not installed ({e}); running rules-only")
-            return None, None
+        from google import genai
+    except Exception as e:
+        log(f"   ! Gemini SDK not installed ({e}); running rules-only")
+        log("     fix:  pip install google-genai")
+        return None, None
+
     key = (CONFIG.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or "").strip()
     if not key:
         log("   ! no Gemini API key set; running rules-only")
         return None, None
-    if hasattr(genai, 'configure'):
-        genai.configure(api_key=key)
-    else:
-        genai.api_key = key
-    client = genai
 
-    # List all available models and pick one that works
-    tried_models = []
+    client = genai.Client(api_key=key)
+
+    candidates = []
     try:
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                model_name = m.name.replace('models/', '')
-                tried_models.append(model_name)
-                log(f"   - Available: {model_name}")
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", None) or []
+            if actions and "generateContent" not in actions:
+                continue
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            if name and "embedding" not in name and "aqa" not in name:
+                candidates.append(name)
     except Exception as e:
-        log(f"   Could not list models: {str(e)[:80]}")
+        log(f"   - could not list models ({str(e)[:70]})")
 
-    # Fallback to config list if auto-detect failed
-    if not tried_models:
-        tried_models = list(CONFIG.get("gemini_models", ["gemini-1.5-pro", "gemini-1.5-flash"]))
-        log(f"   Using fallback models: {tried_models}")
+    if candidates:
+        # Prefer flash: fastest and most generous on the free tier.
+        candidates.sort(key=lambda n: (0 if "flash" in n else 1, len(n)))
+        log(f"   {len(candidates)} model(s) available to this key")
+    else:
+        candidates = list(CONFIG.get("gemini_models") or [])
+        log(f"   falling back to configured models: {', '.join(candidates)}")
 
-    # Try each model
-    for model in tried_models:
+    for model in candidates:
         try:
-            log(f"   Testing {model}...")
-            genai.GenerativeModel(model).generate_content(".")
-            log(f"   ✓ Gemini ready: {model}")
-            return client, [model] + [m for m in tried_models if m != model]
+            client.models.generate_content(model=model, contents="ping")
+            log(f"   Gemini ready: {model}")
+            return client, [model] + [m for m in candidates if m != model]
         except Exception as e:
             msg = str(e)
-            if "401" in msg or "permission" in msg.lower():
-                log(f"   ! API key error: {msg[:60]}")
+            if _overloaded(msg):
+                log(f"   - {model} is busy; keeping it as a fallback")
+                continue
+            if "401" in msg or "API_KEY_INVALID" in msg or "PERMISSION_DENIED" in msg:
+                log(f"   ! key rejected: {msg[:70]}")
                 return None, None
-            log(f"   ✗ {model}: {msg[:60]}")
+            log(f"   - {model} unavailable ({msg[:60]})")
 
-    log("   ! no Gemini model available; running rules-only")
+    log("   ! no usable Gemini model; running rules-only")
     return None, None
 
 
