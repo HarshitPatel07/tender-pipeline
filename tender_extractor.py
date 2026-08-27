@@ -198,8 +198,23 @@ def walk_drive(folder_id: str, rel: str = "", depth: int = 0, max_depth: int = 6
             yield (f"{rel}/{it['name']}".strip("/"), it["id"])
 
 
+# rel path -> Drive file id, for the folder mirrored by the last download.
+# The cache key folds these in, so replacing a document in Drive changes the
+# key and forces that tender to be re-read.
+DRIVE_IDS: dict[str, str] = {}
+
+MANIFEST_NAME = ".drive_manifest.json"
+
+
 def download_drive_folder(url_or_id: str, dest: Path) -> Path:
-    """Mirror the shared Drive folder into `dest`, preserving structure."""
+    """Mirror the shared Drive folder into `dest`, preserving structure.
+
+    Skipping every file that already exists locally is what made the tool
+    show yesterday's answers: correct a document in Drive and the old copy
+    was kept forever. A manifest of rel-path -> Drive id is written beside
+    the files, so a document whose id has changed is re-fetched and one that
+    has been removed from Drive stops being read.
+    """
     import gdown
 
     root_id = drive_folder_id(url_or_id)
@@ -212,16 +227,57 @@ def download_drive_folder(url_or_id: str, dest: Path) -> Path:
             "'local_folder' and use a mounted Drive path instead."
         )
     log(f"   found {len(files)} document(s) in Drive")
+
+    manifest_path = dest / MANIFEST_NAME
+    previous: dict[str, str] = {}
+    if manifest_path.exists():
+        try:
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            previous = {}
+
+    current = {rel: fid for rel, fid in files}
+    DRIVE_IDS.clear()
+    DRIVE_IDS.update(current)
+
+    fetched = replaced = 0
     for rel, fid in files:
         target = dest / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() and target.stat().st_size > 0:
+        have = target.exists() and target.stat().st_size > 0
+        changed = previous.get(rel) not in (None, fid)
+        if have and not changed:
             continue
-        log(f"   downloading {rel}")
+        if changed:
+            log(f"   changed in Drive, re-downloading {rel}")
+            replaced += 1
+        else:
+            log(f"   downloading {rel}")
+            fetched += 1
         try:
             gdown.download(id=fid, output=str(target), quiet=True)
         except Exception as e:
             log(f"   ! download failed for {rel}: {e}")
+
+    # Anything the manifest knew about that Drive no longer lists has been
+    # deleted there. Leaving the local copy would keep it in the summary.
+    for rel in previous:
+        if rel not in current:
+            stale = dest / rel
+            if stale.exists():
+                log(f"   removed from Drive, dropping local copy: {rel}")
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+
+    if replaced:
+        log(f"   {replaced} document(s) had changed in Drive")
+    try:
+        manifest_path.write_text(json.dumps(current, indent=1),
+                                 encoding="utf-8")
+    except Exception:
+        pass
     return dest
 
 
@@ -1784,13 +1840,39 @@ def discover_tenders(root: Path) -> list[tuple[str, list[Path]]]:
     return tenders
 
 
+def _drive_id_for(path: Path) -> str:
+    """Drive id of a downloaded file, matched on its full relative path.
+
+    Matching on the bare file name would collide: several tenders ship a
+    'GeM _ Upload Documents.pdf', and the first id found would then stand in
+    for all of them, so a change to one would not invalidate the others.
+    """
+    p = str(path).replace("\\", "/")
+    for rel, fid in DRIVE_IDS.items():
+        r = rel.replace("\\", "/")
+        if p == r or p.endswith("/" + r):
+            return fid
+    return ""
+
+
 def _tender_hash(files: list[Path]) -> str:
+    """Fingerprint a tender's inputs.
+
+    Size alone missed real edits - a corrected page that happens to occupy
+    the same number of bytes, and every Drive-side replacement, since the
+    local copy was never refreshed. Modification time and the Drive file id
+    are folded in so a document that has actually changed moves the key.
+    """
     h = hashlib.sha1()
-    for f in files:
+    for f in sorted(files, key=lambda p: str(p).lower()):
         try:
-            h.update(f"{f.name}:{f.stat().st_size}".encode())
+            st = f.stat()
+            h.update(f"{f.name}:{st.st_size}:{int(st.st_mtime)}".encode())
         except OSError:
             h.update(f.name.encode())
+        fid = _drive_id_for(f)
+        if fid:
+            h.update(fid.encode())
     return h.hexdigest()[:16]
 
 
