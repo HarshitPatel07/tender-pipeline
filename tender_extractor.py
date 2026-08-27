@@ -259,20 +259,46 @@ def download_drive_folder(url_or_id: str, dest: Path) -> Path:
         except Exception as e:
             log(f"   ! download failed for {rel}: {e}")
 
-    # Anything the manifest knew about that Drive no longer lists has been
-    # deleted there. Leaving the local copy would keep it in the summary.
-    for rel in previous:
-        if rel not in current:
-            stale = dest / rel
-            if stale.exists():
-                log(f"   removed from Drive, dropping local copy: {rel}")
-                try:
-                    stale.unlink()
-                except OSError:
-                    pass
+    # Reconcile the whole mirror against what Drive actually lists now.
+    # Trusting the manifest alone was not enough: the first run after any
+    # upgrade has no manifest, so deleted tenders would survive on disk and
+    # keep appearing in the summary. Every readable document under dest that
+    # Drive no longer lists is dropped, whether or not we recorded it.
+    wanted = {r.replace("\\", "/") for r in current}
+    dropped = 0
+    for path in sorted(dest.rglob("*")):
+        if not path.is_file() or path.name == MANIFEST_NAME:
+            continue
+        if path.suffix.lower() not in READERS:
+            continue
+        rel = str(path.relative_to(dest)).replace("\\", "/")
+        if rel in wanted:
+            continue
+        log(f"   removed from Drive, dropping local copy: {rel}")
+        try:
+            path.unlink()
+            dropped += 1
+        except OSError:
+            pass
+
+    # Prune directories the deletions emptied, deepest first, so a tender
+    # folder that no longer exists in Drive stops being listed at all.
+    for d in sorted((p for p in dest.rglob("*") if p.is_dir()),
+                    key=lambda p: len(p.parts), reverse=True):
+        try:
+            next(d.iterdir())
+        except StopIteration:
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+        except OSError:
+            pass
 
     if replaced:
         log(f"   {replaced} document(s) had changed in Drive")
+    if dropped:
+        log(f"   {dropped} document(s) no longer in Drive were removed")
     try:
         manifest_path.write_text(json.dumps(current, indent=1),
                                  encoding="utf-8")
