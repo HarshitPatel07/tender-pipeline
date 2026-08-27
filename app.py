@@ -150,6 +150,14 @@ st.caption(
     "the live progress below tells you exactly what it is doing."
 )
 
+fresh = st.checkbox(
+    "Force a fresh read (ignore anything remembered from a previous run)")
+st.caption(
+    "Results are remembered between runs so a repeat is fast, and a tender is "
+    "re-read automatically whenever its documents change in Drive. Tick this "
+    "only if you want every document read again from scratch regardless."
+)
+
 go = st.button("Extract tenders", type="primary")
 
 if go:
@@ -168,7 +176,7 @@ if go:
             "gemini_api_key": gemini_key.strip(),
             "use_gemini": bool(gemini_key.strip()),
             "work_dir": "tender_work",
-            "use_cache": True,
+            "use_cache": not fresh,
             "ocr_dpi": 200,
             "ocr_max_pages_per_file": 25,
             "gemini_retries": 3,
