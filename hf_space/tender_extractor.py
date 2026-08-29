@@ -1718,7 +1718,7 @@ def _call_gemini(client, models: list[str], prompt: str) -> dict:
 
 def _merge_ai(results: list[dict]) -> dict[str, Cand]:
     """Merge per-chunk AI results: longest wins for prose, best confidence for scalars."""
-    rank = {"high": 3, "medium": 2, "low": 1, "": 0}
+    rank = {"high": 3, "medium": 2, "low": 1, "not_found": -1, "": 0}
     merged: dict[str, Cand] = {}
     for res in results:
         fields = (res or {}).get("fields") or {}
@@ -1727,21 +1727,31 @@ def _merge_ai(results: list[dict]) -> dict[str, Cand]:
             if not isinstance(item, dict):
                 continue
             val = str(item.get("value") or "").strip()
-            if not val or val.upper().startswith("NOT FOUND"):
+            if not val:
                 continue
+            
+            if val.upper().startswith("NOT FOUND"):
+                conf = "not_found"
+            else:
+                conf = str(item.get("confidence") or "medium").lower()
+                
             ref = str(item.get("source_file") or "").strip()
             pageno = str(item.get("page") or "").strip()
             if ref and pageno:
                 ref = f"{ref} (p.{pageno})"
-            conf = str(item.get("confidence") or "medium").lower()
+                
             cand = Cand(val, ref or "AI", conf if conf in rank else "medium")
             cur = merged.get(key)
             if cur is None:
                 merged[key] = cand
+            elif conf == "not_found":
+                pass
+            elif cur.conf == "not_found":
+                merged[key] = cand
             elif key in PROSE_FIELDS:
                 if len(val) > len(cur.value):
                     merged[key] = cand
-            elif rank[cand.conf] > rank[cur.conf]:
+            elif rank[cand.conf] > rank.get(cur.conf, 0):
                 merged[key] = cand
     return merged
 
@@ -1763,8 +1773,9 @@ def ai_extract(pages: list[Page], gemini_client, gemini_models, groq_key: str = 
 
     provider = CONFIG.get("ai_provider", "auto").lower()
     chunk_size = 15_000 if (use_groq and provider in ("auto", "groq")) else 120_000
+    max_chunks = 40 if (use_groq and provider in ("auto", "groq")) else CONFIG.get("gemini_max_chunks", 8)
     corpus = _corpus(pages)
-    chunks = _chunks(corpus, chunk_size=chunk_size, max_chunks=CONFIG.get("gemini_max_chunks", 8))
+    chunks = _chunks(corpus, chunk_size=chunk_size, max_chunks=max_chunks)
     results = []
 
     for n, ch in enumerate(chunks, start=1):
@@ -1787,7 +1798,8 @@ def ai_extract(pages: list[Page], gemini_client, gemini_models, groq_key: str = 
             log(f"   ! AI pass {n} could not be completed")
 
         if n < len(chunks):
-            missing = [k for k, _ in FIELDS if k not in _merge_ai(results)]
+            current_merged = _merge_ai(results)
+            missing = [k for k, _ in FIELDS if k not in current_merged or current_merged[k].conf == "not_found"]
             if not missing:
                 log(f"     all 13 fields found; skipping {len(chunks) - n} remaining pass(es)")
                 break
