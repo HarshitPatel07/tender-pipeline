@@ -1999,17 +1999,17 @@ def write_excel(rows: list[dict], out_path: Path) -> Path:
                 return str(v.value).strip()
             return ""
             
-        crm_row['Pipeline Name'] = _val('Tender Name')
-        crm_row['Amount'] = _val('Tender Estimated Cost')
-        crm_row['EMD Amount'] = _val('Tender EMD')
-        crm_row['Amount of Tender Fees'] = _val('Tender Fees')
-        crm_row['Date of Submission'] = _val('Tender Submission Date')
+        crm_row['Pipeline Name'] = _val('tender_name')
+        crm_row['Amount'] = _val('estimated_cost')
+        crm_row['EMD Amount'] = _val('emd')
+        crm_row['Amount of Tender Fees'] = _val('tender_fees')
+        crm_row['Closing Date'] = _val('submission_date')
         
-        loc = _val('Location / Address')
+        loc = _val('location')
         crm_row['State'] = loc
         crm_row['City Name'] = loc
         
-        name_val = _val('Tender Name')
+        name_val = _val('tender_name')
         if "GEM/" in name_val.upper():
             try:
                 crm_row['Tender No.'] = "GEM/" + name_val.upper().split("GEM/")[1].split(" ")[0].strip()
@@ -2017,12 +2017,18 @@ def write_excel(rows: list[dict], out_path: Path) -> Path:
                 crm_row['Tender No.'] = name_val
         elif "-" in name_val:
             crm_row['Tender No.'] = name_val.split("-")[0].strip()
+        else:
+            crm_row['Tender No.'] = name_val
             
         desc_parts = []
-        for f in ['Purpose / Audit Type', 'Scope of Work', 'Eligibility Criteria', 'Penalty', 'Tender SD']:
+        for f, label in [('purpose', 'Purpose / Audit Type'), 
+                         ('scope_of_work', 'Scope of Work'), 
+                         ('eligibility', 'Eligibility Criteria'), 
+                         ('penalty', 'Penalty'), 
+                         ('sd', 'Tender SD')]:
             v = _val(f)
             if v:
-                desc_parts.append(f"{f}:\n{v}")
+                desc_parts.append(f"{label}:\n{v}")
         crm_row['Description'] = "\n\n".join(desc_parts)
 
         for c_i, header in enumerate(headers, start=1):
