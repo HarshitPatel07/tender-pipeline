@@ -1762,7 +1762,7 @@ def ai_extract(pages: list[Page], gemini_client, gemini_models, groq_key: str = 
         return {}, False
 
     provider = CONFIG.get("ai_provider", "auto").lower()
-    chunk_size = 35_000 if (use_groq and provider in ("auto", "groq")) else 120_000
+    chunk_size = 15_000 if (use_groq and provider in ("auto", "groq")) else 120_000
     corpus = _corpus(pages)
     chunks = _chunks(corpus, chunk_size=chunk_size, max_chunks=CONFIG.get("gemini_max_chunks", 8))
     results = []
