@@ -1861,7 +1861,11 @@ def discover_tenders(root: Path) -> list[tuple[str, list[Path]]]:
             log(f"   - {d.name}: no readable documents found")
     loose = [p for p in sorted(root.glob("*")) if p.is_file()
              and p.suffix.lower() in READERS and not _excluded_file(p.name)]
-    if loose and not tenders:
+    # Documents sitting directly in the root used to be read only when there
+    # were no sub-folders at all, so a folder holding both tender sub-folders
+    # and a few loose files silently dropped the loose ones - no warning, they
+    # simply never appeared in the summary.
+    if loose:
         tenders.append((root.name, loose))
     return tenders
 
