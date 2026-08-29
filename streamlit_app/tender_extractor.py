@@ -2000,10 +2000,33 @@ def write_excel(rows: list[dict], out_path: Path) -> Path:
             return ""
             
         crm_row['Pipeline Name'] = _val('tender_name')
-        crm_row['Amount'] = _val('estimated_cost')
+        
+        # Clean Amount to digits for CRM Currency field
+        est = _val('estimated_cost')
+        import re
+        amt_match = re.search(r"(\d[\d,]*(?:\.\d+)?)", est)
+        if amt_match:
+            try:
+                amt = float(amt_match.group(1).replace(",", ""))
+                tail = est[amt_match.end(): amt_match.end() + 14].lower()
+                if re.match(r"\s*(?:/-)?\s*(?:crores?|cr\b)", tail):
+                    amt *= 1e7
+                elif re.match(r"\s*(?:/-)?\s*(?:lakh?s?|lacs?)", tail):
+                    amt *= 1e5
+                crm_row['Amount'] = str(int(amt))
+            except:
+                crm_row['Amount'] = ""
+        else:
+            crm_row['Amount'] = ""
+            
         crm_row['EMD Amount'] = _val('emd')
+        crm_row['Details of EMD'] = _val('emd')
         crm_row['Amount of Tender Fees'] = _val('tender_fees')
-        crm_row['Closing Date'] = _val('submission_date')
+        
+        sub_date = _val('submission_date')
+        crm_row['Closing Date'] = sub_date
+        crm_row['Date of Submission'] = sub_date
+        crm_row['Due Date of Tender'] = sub_date
         
         loc = _val('location')
         crm_row['State'] = loc
