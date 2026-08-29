@@ -1,0 +1,11 @@
+gradio
+pymupdf
+gdown
+python-docx
+openpyxl
+pandas
+xlrd
+requests
+pytesseract
+pillow
+google-genai

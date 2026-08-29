@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tender Pipeline</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    --ground:      #F1F4F3;
+    --surface:     #FFFFFF;
+    --surface-sub: #E9EEEC;
+    --line:        #D3DCD9;
+    --line-soft:   #E4EAE8;
+    --ink:         #10262C;
+    --ink-soft:    #46605E;
+    --ink-faint:   #7B918D;
+    --accent:      #14655A;
+    --accent-soft: #DDEAE6;
+    --ok:          #2C7150;
+    --warn:        #9A6A11;
+    --warn-bg:     #FBF1DC;
+    --crit:        #9E3527;
+    --crit-bg:     #F9E5E1;
+    --shadow:      0 1px 2px rgba(16,38,44,.06), 0 6px 18px rgba(16,38,44,.05);
+    --shadow-hover: 0 2px 4px rgba(16,38,44,.09), 0 16px 30px rgba(16,38,44,.11);
+  }
+  :root:not([data-theme="light"]) { }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #0C1A1E;
+      --surface:     #132A2F;
+      --surface-sub: #1B363B;
+      --line:        #27474C;
+      --line-soft:   #1F3B40;
+      --ink:         #E7EEEC;
+      --ink-soft:    #A9C0BC;
+      --ink-faint:   #7B948F;
+      --accent:      #5BB9A6;
+      --accent-soft: #17403C;
+      --ok:          #63BA8D;
+      --warn:        #D9A94A;
+      --warn-bg:     #33290F;
+      --crit:        #E2867A;
+      --crit-bg:     #3A1D18;
+      --shadow:      0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.28);
+      --shadow-hover: 0 2px 6px rgba(0,0,0,.38), 0 18px 34px rgba(0,0,0,.34);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:      #0C1A1E;
+    --surface:     #132A2F;
+    --surface-sub: #1B363B;
+    --line:        #27474C;
+    --line-soft:   #1F3B40;
+    --ink:         #E7EEEC;
+    --ink-soft:    #A9C0BC;
+    --ink-faint:   #7B948F;
+    --accent:      #5BB9A6;
+    --accent-soft: #17403C;
+    --ok:          #63BA8D;
+    --warn:        #D9A94A;
+    --warn-bg:     #33290F;
+    --crit:        #E2867A;
+    --crit-bg:     #3A1D18;
+    --shadow:      0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.28);
+    --shadow-hover: 0 2px 6px rgba(0,0,0,.38), 0 18px 34px rgba(0,0,0,.34);
+  }
+
+  * { box-sizing: border-box; }
+  html { background: var(--ground); }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+    font-size: 15px; line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    border-top: 3px solid var(--accent);
+  }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 30px 24px 72px; }
+
+  /* ---------- masthead ---------- */
+  .mast { display: flex; flex-wrap: wrap; align-items: flex-end;
+          justify-content: space-between; gap: 16px;
+          padding-bottom: 16px; border-bottom: 1px solid var(--line); position: relative; }
+  .mast::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px;
+                 height: 2px; width: 64px; background: var(--accent); }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .mark { flex: none; display: block; border-radius: 9px; }
+  h1 { font-family: 'Source Serif 4', Georgia, serif; font-weight: 700;
+       font-size: clamp(28px, 4vw, 40px); line-height: 1.1; margin: 0;
+       letter-spacing: -.01em; text-wrap: balance; }
+  .mast .sub { color: var(--ink-soft); font-size: 13.5px; margin-top: 5px; }
+  .runstamp { font-family: 'IBM Plex Mono', monospace; font-size: 11.5px;
+              color: var(--ink-soft); text-align: right; white-space: nowrap;
+              padding: 5px 11px; border-radius: 999px; background: var(--surface-sub);
+              border: 1px solid var(--line-soft); }
+
+  /* ---------- summary tiles ---------- */
+  .tiles { display: grid; gap: 12px; margin: 22px 0 8px;
+           grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  .tile { display: flex; gap: 12px; align-items: flex-start;
+          background: var(--surface); border: 1px solid var(--line-soft);
+          border-radius: 6px; padding: 14px 16px; box-shadow: var(--shadow); }
+  .tile .icon { flex: none; width: 30px; height: 30px; border-radius: 7px;
+                display: flex; align-items: center; justify-content: center;
+                background: var(--accent-soft); color: var(--accent); }
+  .tile .icon svg { width: 17px; height: 17px; }
+  .tile .k { font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase;
+             color: var(--ink-faint); font-weight: 600; }
+  .tile .v { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums;
+             font-size: 25px; font-weight: 600; margin-top: 5px; line-height: 1.1; }
+  .tile .n { font-size: 12px; color: var(--ink-soft); margin-top: 3px; }
+  .tile.alert { border-color: var(--warn); background: var(--warn-bg); }
+  .tile.alert .v { color: var(--warn); }
+  .tile.alert .icon { background: rgba(0,0,0,.06); color: var(--warn); }
+
+  /* ---------- controls ---------- */
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+              margin: 22px 0 18px; padding: 12px; background: var(--surface-sub);
+              border: 1px solid var(--line-soft); border-radius: 4px; }
+  input[type=search], select {
+    font: inherit; font-size: 14px; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--line); border-radius: 3px; padding: 8px 10px; }
+  input[type=search] { flex: 1 1 240px; min-width: 180px; }
+  .chk { display: inline-flex; align-items: center; gap: 7px; font-size: 13.5px;
+         color: var(--ink-soft); cursor: pointer; user-select: none; }
+  .chk input { accent-color: var(--accent); width: 15px; height: 15px; }
+  :is(input, select, summary, button):focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px; }
+  .count { margin-left: auto; font-size: 12.5px; color: var(--ink-faint);
+           font-family: 'IBM Plex Mono', monospace; }
+
+  /* ---------- tender cards ---------- */
+  .cards { display: grid; gap: 16px;
+           grid-template-columns: repeat(auto-fit, minmax(500px, 1fr)); }
+  .card { background: var(--surface); border: 1px solid var(--line-soft);
+          border-left: 4px solid var(--ink-faint); border-radius: 6px;
+          box-shadow: var(--shadow); overflow: hidden; display: flex;
+          flex-direction: column; min-width: 0;
+          animation: cardIn .28s ease both;
+          transition: transform .15s ease, box-shadow .15s ease; }
+  .card:hover { transform: translateY(-2px); box-shadow: var(--shadow-hover); }
+  @keyframes cardIn { from { opacity: 0; transform: translateY(7px); }
+                      to { opacity: 1; transform: none; } }
+  .card.urgent { border-left-color: var(--crit); }
+  .card.soon   { border-left-color: var(--warn); }
+  .card.open   { border-left-color: var(--ok); }
+  .card.past   { border-left-color: var(--ink-faint); opacity: .72; }
+
+  .chead { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start;
+           padding: 16px 18px 12px; border-bottom: 1px solid var(--line-soft); }
+  .chead .id { font-family: 'IBM Plex Mono', monospace; font-size: 11.5px;
+               color: var(--ink-faint); letter-spacing: .04em; }
+  .chead h2 { font-family: 'Source Serif 4', Georgia, serif; font-size: 19px;
+              font-weight: 600; margin: 3px 0 0; line-height: 1.28;
+              text-wrap: balance; }
+  .chead .grow { flex: 1 1 320px; min-width: 0; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip { font-size: 11.5px; padding: 3px 9px; border-radius: 999px;
+          background: var(--accent-soft); color: var(--accent); font-weight: 600;
+          border: 1px solid transparent; }
+  .chip.plain { background: transparent; border-color: var(--line);
+                color: var(--ink-soft); font-weight: 500; }
+  .due { text-align: right; flex: 0 0 auto; }
+  .due .d { font-family: 'IBM Plex Mono', monospace; font-size: 14.5px;
+            font-weight: 600; font-variant-numeric: tabular-nums; }
+  .pill { display: inline-block; margin-top: 5px; font-size: 11.5px;
+          font-weight: 600; padding: 3px 10px; border-radius: 999px;
+          border: 1px solid currentColor; }
+  .pill.urgent { color: var(--crit); background: var(--crit-bg); }
+  .pill.soon   { color: var(--warn); background: var(--warn-bg); }
+  .pill.open   { color: var(--ok); }
+  .pill.past   { color: var(--ink-faint); }
+
+  /* ---------- money strip ---------- */
+  .money { display: grid; gap: 1px; background: var(--line-soft);
+           grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  .cell { background: var(--surface); padding: 11px 14px; }
+  .cell .k { font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+             color: var(--ink-faint); font-weight: 600; }
+  .cell .v { font-family: 'IBM Plex Mono', monospace; font-size: 14.5px;
+             font-variant-numeric: tabular-nums; margin-top: 4px;
+             word-break: break-word; }
+  .cell.flagged { background: var(--warn-bg); }
+  .cell.missing .v { color: var(--ink-faint); font-style: italic;
+                     font-family: 'IBM Plex Sans', sans-serif; font-size: 13px; }
+  .mark { font-size: 11px; font-weight: 700; color: var(--warn);
+          cursor: help; margin-left: 4px; }
+
+  /* ---------- meta + detail ---------- */
+  .meta { display: grid; gap: 10px 22px; padding: 13px 18px;
+          border-top: 1px solid var(--line-soft);
+          grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .meta .k { font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+             color: var(--ink-faint); font-weight: 600; }
+  .meta .v { font-size: 13.5px; margin-top: 2px; }
+  details { border-top: 1px solid var(--line-soft); }
+  summary { cursor: pointer; padding: 10px 18px; font-size: 13px; font-weight: 600;
+            color: var(--accent); list-style: none; display: flex; gap: 8px;
+            align-items: center; }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: '+'; font-family: 'IBM Plex Mono', monospace;
+                    font-weight: 600; width: 12px; }
+  details[open] summary::before { content: '\2212'; }
+  .body { padding: 2px 18px 16px; font-size: 13.5px; color: var(--ink-soft);
+          white-space: pre-wrap; max-height: 340px; overflow-y: auto;
+          border-left: 2px solid var(--accent-soft); margin: 0 18px 14px; }
+  .src { font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+         color: var(--ink-faint); padding: 0 18px 12px; }
+
+  .empty { padding: 40px; text-align: center; color: var(--ink-faint);
+           background: var(--surface); border: 1px dashed var(--line);
+           border-radius: 4px; }
+  .note { margin: 20px 0 0; padding: 13px 16px; border-radius: 4px;
+          background: var(--surface); border: 1px solid var(--line-soft);
+          font-size: 13px; color: var(--ink-soft); }
+  .note b { color: var(--ink); }
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 10px;
+            font-size: 12.5px; color: var(--ink-soft); }
+  .sw { display: inline-block; width: 11px; height: 11px; border-radius: 2px;
+        margin-right: 6px; vertical-align: -1px; }
+  footer { margin-top: 34px; padding-top: 14px; border-top: 1px solid var(--line);
+           font-size: 12px; color: var(--ink-faint); }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+  @media print {
+    body { background: #fff; } .controls, footer { display: none; }
+    .card { break-inside: avoid; box-shadow: none; }
+    details { display: block; } .body { max-height: none; }
+  }
+</style>
+
+</head>
+<body>
+
+<div class="wrap">
+  <header class="mast">
+    <div class="brand">
+      <svg class="mark" width="42" height="42" viewBox="0 0 42 42" aria-hidden="true">
+        <rect width="42" height="42" rx="9" fill="var(--accent)"/>
+        <text x="21" y="24" text-anchor="middle" font-family="'Source Serif 4', Georgia, serif"
+              font-size="17" font-weight="700" fill="var(--surface)">TP</text>
+      </svg>
+      <div>
+        <h1>Tender Pipeline</h1>
+        <div class="sub">1 tender folders &middot; 13 fields each &middot; every figure traceable to a page</div>
+      </div>
+    </div>
+    <div class="runstamp">Run 29 Aug 2026, 11:41</div>
+  </header>
+
+  <section class="tiles" id="tiles"></section>
+
+  <div class="controls">
+    <input type="search" id="q" placeholder="Search tender, place, scope, audit type&hellip;"
+           aria-label="Search tenders">
+    <label class="chk"><input type="checkbox" id="fRev"> Needs review</label>
+    <label class="chk"><input type="checkbox" id="fSoon"> Closing in 14 days</label>
+    <select id="sort" aria-label="Sort tenders">
+      <option value="due">Sort: deadline first</option>
+      <option value="folder">Sort: folder number</option>
+      <option value="emd">Sort: EMD highest</option>
+      <option value="review">Sort: most to review</option>
+    </select>
+    <span class="count" id="count"></span>
+  </div>
+
+  <main class="cards" id="cards"></main>
+
+  <div class="note">
+    <b>How to read this.</b> Every figure carries the file and page it came from &mdash;
+    open <em>Where each value came from</em> on any card to check it against the
+    document. Amber means the two readers disagreed, confidence was low, or the
+    value came off a scanned page. This removes the typing, not the review:
+    confirm EMD, fees and the deadline before you act on them.
+    <div class="legend">
+      <span><span class="sw" style="background:var(--crit)"></span>Closes within 3 days</span>
+      <span><span class="sw" style="background:var(--warn)"></span>Closes within 14 days</span>
+      <span><span class="sw" style="background:var(--ok)"></span>Open</span>
+      <span><span class="sw" style="background:var(--ink-faint)"></span>Closed or no date found</span>
+    </div>
+  </div>
+
+  <footer>1 tenders &middot; 0 field(s) flagged for review &middot; open the Excel for the full table</footer>
+</div>
+
+<script>
+const DATA = [{"folder": "docs", "files": [{"name": "210347177.pdf", "pages": 9, "ocr": 0, "note": ""}, {"name": "210347178.pdf", "pages": 7, "ocr": 0, "note": ""}, {"name": "210347179.pdf", "pages": 5, "ocr": 0, "note": ""}, {"name": "210347180.pdf", "pages": 6, "ocr": 0, "note": ""}, {"name": "210347181.pdf", "pages": 1, "ocr": 0, "note": ""}, {"name": "210347182.pdf", "pages": 1, "ocr": 0, "note": ""}, {"name": "210347183.pdf", "pages": 3, "ocr": 0, "note": ""}, {"name": "210347184.pdf", "pages": 29, "ocr": 0, "note": ""}, {"name": "ATTACHMENT - 9 (2).pdf", "pages": 1, "ocr": 0, "note": ""}, {"name": "ATTACHMENT - 9.pdf", "pages": 1, "ocr": 0, "note": ""}, {"name": "Tender-Summary-103392745.pdf", "pages": 7, "ocr": 0, "note": ""}, {"name": "TENDER.pdf", "pages": 417, "ocr": 0, "note": ""}], "fields": {"tender_name": {"label": "1. Tender Name", "value": "GEM/2026/B/7920051 / NIT Ref NO: 9900330303 - Solapur AUD - Statutory audit of ash disposal for FY25-26", "ref": "Tender-Summary-103392745.pdf (p.1)", "conf": "high", "flag": ""}, "location": {"label": "2. Location / Address", "value": "1045-Solapur STPP, Solapur STPP, AT-FATATEWADI, PO-HOTGI STATION, SOUTH SOLAPUR, SOLAPUR, Maharashtra-413215", "ref": "Tender-Summary-103392745.pdf (p.1)", "conf": "high", "flag": ""}, "purpose": {"label": "3. Purpose / Audit Type", "value": "Annual Statutory Ash compliance audit at NTPC Solapur for FY25-26 in compliance to MOEFCC fly ash notification", "ref": "210347180.pdf (p.2)", "conf": "high", "flag": ""}, "period": {"label": "4. Period", "value": "1 Month(s) (Audit report to be submitted before 31.08.2026)", "ref": "210347180.pdf (p.5)", "conf": "high", "flag": ""}, "estimated_cost": {"label": "5. Tender Estimated Cost", "value": "Rs. 145600.0", "ref": "Tender-Summary-103392745.pdf (p.2)", "conf": "high", "flag": ""}, "assignment_fees": {"label": "6. Assignment Fees", "value": "Lumpsum basis (to be quoted by bidder in financial bid)", "ref": "210347184.pdf (p.10)", "conf": "high", "flag": ""}, "eligibility": {"label": "7. Eligibility Criteria", "value": "- Minimum average annual turnover required: Rs. 51 Lakhs in preceding 3 financial years (2021-2022, 2020-2021, 2019-2020)\n- Only CPCB authorized Auditors shall undertake the compliance audit for ash disposal for NTPC Solapur as per MOEF&CC notification dated 31.12.2021\n- Bidder must be a Class-I Local Supplier\n- Bidder should not be under any banning/suspension/withholding with NTPC Ltd.\n- Self-declarations required regarding insolvency, bankruptcy, liquidation, and absence of conflict of interest\n- Mandatory registrations: PAN, GSTIN", "ref": "Tender-Summary-103392745.pdf (p.3)", "conf": "high", "flag": ""}, "scope_of_work": {"label": "8. Scope of Work", "value": "- Statutory audit of ash disposal for FY25-26 at site, preparation and submission of report to CPCB and other concerned authorities with a copy to NTPC Solapur\n- Verification of ash generation data based on coal receipt/consumption records and average ash content, comparing with annual compliance report\n- Verification of fly ash and bottom ash utilization data supplied to user agencies, comparing with annual compliance report\n- Verification of ash disposal into ash ponds (difference of ash generation and utilization)\n- Assessment of total ash storage in operational and un-operational ash ponds and available storage capacity\n- Assessment of ash slurry disposal and ash water re-circulation system (AWRS), water ratio, recycled water, and environmental discharge\n- Recommendations based on gap analysis for better improvement and statutory compliance\n- Final report submission in line with CPCB SOP before 31.08.2026", "ref": "210347180.pdf (p.3)", "conf": "high", "flag": ""}, "penalty": {"label": "9. Penalty", "value": "Liquidated Damages (LD): Applicable; Rs. 5,000/- per day penalty on either party for failure to provide necessary information sought by Independent Engineer during investigation in a time bound manner", "ref": "210347180.pdf (p.5)", "conf": "medium", "flag": ""}, "emd": {"label": "10. Tender EMD", "value": "Not Applicable", "ref": "Tender-Summary-103392745.pdf (p.2)", "conf": "high", "flag": ""}, "sd": {"label": "11. Tender SD", "value": "5.0% of the total Contract Price (2.5% of contract value for MSE-SC/ST and MSE-Women vendors)", "ref": "210347184.pdf (p.17)", "conf": "high", "flag": ""}, "tender_fees": {"label": "12. Tender Fees", "value": "Not Applicable", "ref": "210347179.pdf (p.3)", "conf": "high", "flag": ""}, "submission_date": {"label": "13. Tender Submission Date", "value": "25-08-2026 11:00:00", "ref": "Tender-Summary-103392745.pdf (p.1)", "conf": "high", "flag": ""}}}];
+const MONEY = ["emd","sd","tender_fees","estimated_cost","assignment_fees"];
+const MONEY_LABEL = {emd:"Tender EMD", sd:"Tender SD", tender_fees:"Tender fees",
+  estimated_cost:"Estimated cost", assignment_fees:"Assignment fees"};
+const PROSE = [["scope_of_work","Scope of work"],["eligibility","Eligibility criteria"],
+  ["penalty","Penalty"]];
+const MISSING = /^NOT FOUND/i;
+
+const esc = s => String(s==null?"":s).replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const has = f => f && f.value && !MISSING.test(f.value);
+
+function parseDue(s){
+  if(!s) return null;
+  let m = s.match(/(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})/);
+  if(m){ let y=+m[3]; if(y<100) y+=2000; return new Date(y, +m[2]-1, +m[1]); }
+  m = s.match(/(\d{1,2})\s+([A-Za-z]{3,})\s+(\d{4})/);
+  if(m){ const d=new Date(m[2]+" "+m[1]+", "+m[3]); return isNaN(d)?null:d; }
+  return null;
+}
+function toNum(s){
+  if(!s) return 0;
+  const m = String(s).replace(/,/g,"").match(/(\d+(?:\.\d+)?)/);
+  if(!m) return 0;
+  let v = parseFloat(m[1]);
+  const tail = String(s).slice(String(s).indexOf(m[1])+m[1].length, 40).toLowerCase();
+  if(/^\s*(?:\/-)?\s*crore/.test(tail)) v*=1e7;
+  else if(/^\s*(?:\/-)?\s*(?:lakh|lac)/.test(tail)) v*=1e5;
+  return v;
+}
+const DAY = 864e5;
+const today = new Date(); today.setHours(0,0,0,0);
+function daysLeft(t){
+  const d = parseDue(t.fields.submission_date && t.fields.submission_date.value);
+  return d ? Math.round((d - today)/DAY) : null;
+}
+function state(n){
+  if(n===null) return "past";
+  if(n < 0) return "past";
+  if(n <= 3) return "urgent";
+  if(n <= 14) return "soon";
+  return "open";
+}
+function reviewCount(t){
+  return Object.values(t.fields).filter(f => f.flag).length;
+}
+const fmtINR = v => v >= 1e7 ? "Rs " + (v/1e7).toFixed(2) + " cr"
+                  : v >= 1e5 ? "Rs " + (v/1e5).toFixed(2) + " lakh"
+                  : "Rs " + v.toLocaleString("en-IN");
+
+DATA.forEach(t => {
+  t._days = daysLeft(t); t._state = state(t._days);
+  t._rev = reviewCount(t); t._emd = toNum(has(t.fields.emd) ? t.fields.emd.value : "");
+  t._hay = Object.values(t.fields).map(f => f.value).join(" ").toLowerCase()
+           + " " + t.folder.toLowerCase();
+});
+
+const ICONS = {
+  stack: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="12" height="14" rx="1.5"/><line x1="7" y1="7" x2="13" y2="7"/><line x1="7" y1="10.5" x2="13" y2="10.5"/><line x1="7" y1="14" x2="11" y2="14"/></svg>',
+  calendar: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="14" height="12" rx="1.5"/><line x1="3" y1="8" x2="17" y2="8"/><line x1="6.5" y1="3" x2="6.5" y2="6"/><line x1="13.5" y1="3" x2="13.5" y2="6"/><circle cx="10" cy="12.2" r="1.3" fill="currentColor" stroke="none"/></svg>',
+  rupee: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="10" cy="10" r="7.2"/><text x="10" y="14" text-anchor="middle" font-size="9.5" font-weight="700" fill="currentColor" stroke="none" font-family="inherit">\u20b9</text></svg>',
+  flag: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polygon points="10,3 17.5,15.5 2.5,15.5"/><line x1="10" y1="8" x2="10" y2="11.3"/><circle cx="10" cy="13.4" r=".9" fill="currentColor" stroke="none"/></svg>',
+};
+
+function tiles(list){
+  const live = list.filter(t => t._days !== null && t._days >= 0);
+  const next = live.slice().sort((a,b) => a._days - b._days)[0];
+  const emd = list.reduce((s,t) => s + t._emd, 0);
+  const rev = list.reduce((s,t) => s + t._rev, 0);
+  const nodoc = list.filter(t => Object.values(t.fields).every(f => !has(f))).length;
+  const t = [
+    ["stack", "Tenders", list.length, list.length === 1 ? "in this run" : "folders read"],
+    ["calendar", "Next deadline", next ? next._days + (next._days === 1 ? " day" : " days")
+      : "\u2014", next ? next.folder : "none still open", next && next._days <= 3],
+    ["rupee", "EMD at stake", emd ? fmtINR(emd) : "\u2014", "total across open tenders"],
+    ["flag", "Fields to verify", rev, "amber or red cells", rev > 0],
+  ];
+  if (nodoc) t.push(["flag", "No documents", nodoc, "folder(s) with nothing readable", true]);
+  document.getElementById("tiles").innerHTML = t.map(([icon,k,v,n,a]) =>
+    `<div class="tile${a ? " alert" : ""}"><div class="icon">${ICONS[icon]}</div>
+     <div><div class="k">${esc(k)}</div>
+     <div class="v">${esc(v)}</div><div class="n">${esc(n)}</div></div></div>`).join("");
+}
+
+function cell(t, key){
+  const f = t.fields[key] || {};
+  const ok = has(f);
+  const cls = !ok ? "cell missing" : (f.flag ? "cell flagged" : "cell");
+  const mark = f.flag ? `<span class="mark" title="${esc(f.flag)}">&#9888;</span>` : "";
+  return `<div class="${cls}"><div class="k">${esc(MONEY_LABEL[key])}</div>
+    <div class="v">${ok ? esc(f.value) : "not stated"}${mark}</div></div>`;
+}
+
+function card(t){
+  const f = t.fields;
+  const dueTxt = has(f.submission_date) ? f.submission_date.value : "no date found";
+  const pill = t._days === null ? "no deadline read"
+    : t._days < 0 ? "closed" : t._days === 0 ? "closes today"
+    : t._days + (t._days === 1 ? " day left" : " days left");
+  const chips = [];
+  if (has(f.purpose)) chips.push(`<span class="chip">${esc(f.purpose.value.slice(0,90))}</span>`);
+  if (has(f.period)) chips.push(`<span class="chip plain">Period: ${esc(f.period.value.slice(0,80))}</span>`);
+  if (t._rev) chips.push(`<span class="chip plain">${t._rev} to verify</span>`);
+
+  const prose = PROSE.filter(([k]) => has(f[k])).map(([k,lab]) =>
+    `<details><summary>${esc(lab)}</summary>
+      <div class="body">${esc(f[k].value)}</div>
+      <div class="src">Source: ${esc(f[k].ref || "\u2014")}</div></details>`).join("");
+
+  const refs = Object.entries(f).map(([k,v]) =>
+      has(v) ? `${esc(v.label)} &rarr; ${esc(v.ref || "no page recorded")}${
+        v.flag ? ` <b>(${esc(v.flag)})</b>` : ""}` : null)
+    .filter(Boolean).join("<br>");
+  const docs = (t.files || []).map(d =>
+    `${esc(d.name)} &mdash; ${d.pages} page(s)${d.ocr ? `, ${d.ocr} via OCR` : ""}${
+      d.note ? ` <i>(${esc(d.note)})</i>` : ""}`).join("<br>");
+
+  return `<article class="card ${t._state}">
+    <div class="chead">
+      <div class="grow">
+        <div class="id">${esc(t.folder)}</div>
+        <h2>${esc(has(f.tender_name) ? f.tender_name.value : t.folder)}</h2>
+        <div class="chips">${chips.join("")}</div>
+      </div>
+      <div class="due">
+        <div class="d">${esc(dueTxt)}</div>
+        <span class="pill ${t._state}">${esc(pill)}</span>
+      </div>
+    </div>
+    <div class="money">${MONEY.map(k => cell(t,k)).join("")}</div>
+    <div class="meta">
+      <div><div class="k">Location / address</div>
+        <div class="v">${has(f.location) ? esc(f.location.value) : "<i>not stated</i>"}</div></div>
+      <div><div class="k">Period</div>
+        <div class="v">${has(f.period) ? esc(f.period.value) : "<i>not stated</i>"}</div></div>
+    </div>
+    ${prose}
+    <details><summary>Where each value came from</summary>
+      <div class="body">${refs || "nothing extracted"}</div></details>
+    <details><summary>Documents read (${(t.files || []).length})</summary>
+      <div class="body">${docs || "none"}</div></details>
+  </article>`;
+}
+
+function render(){
+  const q = document.getElementById("q").value.trim().toLowerCase();
+  const rev = document.getElementById("fRev").checked;
+  const soon = document.getElementById("fSoon").checked;
+  const sort = document.getElementById("sort").value;
+  let list = DATA.filter(t => (!q || t._hay.includes(q))
+    && (!rev || t._rev > 0)
+    && (!soon || (t._days !== null && t._days >= 0 && t._days <= 14)));
+  const rank = {urgent:0, soon:1, open:2, past:3};
+  list.sort((a,b) => sort === "folder" ? a.folder.localeCompare(b.folder)
+    : sort === "emd" ? b._emd - a._emd
+    : sort === "review" ? b._rev - a._rev
+    : (rank[a._state] - rank[b._state]) || ((a._days ?? 1e9) - (b._days ?? 1e9)));
+  document.getElementById("cards").innerHTML = list.length
+    ? list.map(card).join("")
+    : `<div class="empty">No tender matches that filter.</div>`;
+  document.getElementById("count").textContent =
+    list.length + " of " + DATA.length + " shown";
+  tiles(DATA);
+}
+["q","fRev","fSoon","sort"].forEach(id =>
+  document.getElementById(id).addEventListener("input", render));
+render();
+
+// Lets a host page embedding this as an iframe (e.g. the Colab notebook)
+// resize the frame to fit, instead of showing a nested scrollbar. Harmless
+// when opened as a plain file - there is simply no parent listening.
+(function () {
+  function report() {
+    try { parent.postMessage({ tenderDashHeight: document.body.scrollHeight }, "*"); }
+    catch (e) {}
+  }
+  window.addEventListener("resize", report);
+  new MutationObserver(report).observe(document.body, {
+    childList: true, subtree: true, attributes: true });
+  report();
+  setTimeout(report, 300);
+})();
+</script>
+
+</body>
+</html>

@@ -1,1 +1,9 @@
 .env
+__pycache__/
+*.pyc
+*.bak
+tender_work/
+_test_output.xlsx
+.drive_manifest.json
+.vscode/
+.idea/
