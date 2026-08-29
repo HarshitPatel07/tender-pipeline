@@ -1479,9 +1479,9 @@ Field meanings:
 4  period           Audit period or contract/engagement duration (FY, months, years).
 5  estimated_cost   Tender estimated value / estimated contract cost.
 6  assignment_fees  Fee payable for the assignment (audit/professional fee).
-7  eligibility      Eligibility / pre-qualification criteria. Extract ALL criteria fully.
-8  scope_of_work    Scope of work / terms of reference. Extract ALL points fully.
-9  penalty          Penalty, liquidated damages, deduction clauses. Do not mix with banning clauses.
+7  eligibility      Eligibility / pre-qualification criteria. Extract ALL criteria and points fully verbatim. DO NOT summarize or shorten!
+8  scope_of_work    Scope of work / terms of reference. Extract ALL points fully verbatim. DO NOT summarize or shorten!
+9  penalty          Penalty, liquidated damages, deduction clauses. Extract the full clause. Do not mix with banning clauses.
 10 emd              Earnest money deposit / bid security.
 11 sd               Security deposit / performance guarantee / PBG.
 12 tender_fees      Cost of tender document / bid processing or application fee.
@@ -1493,6 +1493,8 @@ Return ONLY a JSON object of this exact shape:
 where field_key is one of: tender_name, location, purpose, period,
 estimated_cost, assignment_fees, eligibility, scope_of_work, penalty, emd, sd,
 tender_fees, submission_date
+
+CRITICAL INSTRUCTION: For 'eligibility', 'scope_of_work', and 'penalty', you must extract the FULL, LONG details exactly as they appear in the text. Do NOT summarize, do NOT shorten, and do NOT truncate. Maximum accuracy is required.
 """
 
 
