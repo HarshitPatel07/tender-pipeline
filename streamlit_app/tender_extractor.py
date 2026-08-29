@@ -1598,7 +1598,8 @@ def _gemini_client():
                 if "401" in msg or "API_KEY_INVALID" in msg or "PERMISSION_DENIED" in msg:
                     log(f"   ! Gemini key rejected: {msg[:70]}")
                     return None, None
-                log(f"   - {model} unavailable ({msg[:60]})")
+                # Silently skip unavailable models without logging to avoid console spam
+                pass
     except Exception as e:
         log(f"   ! Gemini client init error: {e}")
 
