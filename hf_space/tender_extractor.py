@@ -1863,8 +1863,13 @@ def merge(rules: dict[str, Cand], ai: dict[str, Cand],
         a = ai.get(key) or Cand()
         res = Result(rules_value=r.value, ai_value=a.value)
 
-        if a.value:
-            res.value, res.ref, res.conf = a.value, (a.ref or r.ref), a.conf
+        is_ai_missing = not a.value or a.value.upper().startswith("NOT FOUND")
+        if not is_ai_missing:
+            # If AI found it, but Rules found a massive numbered list for a prose field, trust the Rules!
+            if key in ("eligibility", "scope_of_work", "penalty") and r.value and len(str(r.value)) > len(str(a.value)) + 50:
+                res.value, res.ref, res.conf = r.value, r.ref, r.conf
+            else:
+                res.value, res.ref, res.conf = a.value, (a.ref or r.ref), a.conf
         elif r.value:
             res.value, res.ref, res.conf = r.value, r.ref, r.conf
         else:
