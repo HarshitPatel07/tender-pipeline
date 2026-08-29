@@ -1942,44 +1942,85 @@ def write_excel(rows: list[dict], out_path: Path) -> Path:
 
     wb = Workbook()
 
-    # ---- Sheet 1: Tender Summary -----------------------------------------
+    # ---- Sheet 1: Zoho CRM Pipeline Import -------------------------------
     ws = wb.active
-    ws.title = "Tender Summary"
-    headers = ["Tender Folder"] + [label for _, label in FIELDS] + ["Needs Review"]
+    ws.title = "CRM Import"
+    headers = [
+        'Pipeline Id', 'Pipeline Owner.id', 'Pipeline Owner', 'Amount', 'Pipeline Name', 
+        'Closing Date', 'Company Name.id', 'Company Name', 'Stage', 'Type', 'Lead Source', 
+        'Contact Name.id', 'Contact Name', 'Created By.id', 'Created By', 'Modified By.id', 
+        'Modified By', 'Created Time', 'Modified Time', 'Last Activity Time', 'Layout.id', 
+        'Layout', 'Tag', 'Description', 'Pipeline', 'Record Creation Source ID', 
+        'Specific Reason for not Applying', 'EMD Amount', 'EMD Issuance Bank', 'Details of EMD', 
+        'Date / Transfer of EMD', 'Amount of Tender Fees', 'Tech. Bid Opening', 'Fin. Bid Opening', 
+        'L1 - Information', 'L2 - Information', 'L3 - Information', 'Tender No.', 
+        'Date of Receiving of Tender Info.', 'State', 'City Name', 'Brief Reason for not applying', 
+        'Tender Selection Method', 'Pre-Bid meeting', 'Date of Submission', 'Actual Submission Date', 
+        'EMD Refund Status', 'Sector', 'Details of Dispatch', 'Our Quote', 'Due Date of Tender'
+    ]
     ws.append(headers)
     for c in range(1, len(headers) + 1):
         cell = ws.cell(row=1, column=c)
         cell.fill, cell.font, cell.border = hdr_fill, hdr_font, box
-        cell.alignment = Alignment(wrap_text=True, vertical="center",
-                                   horizontal="center")
+        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
     ws.row_dimensions[1].height = 34
 
     for r_i, row in enumerate(rows, start=2):
         res: dict[str, Result] = row["results"]
-        flags = [label for key, label in FIELDS if res[key].flag]
-        ws.cell(row=r_i, column=1, value=row["tender"])
-        for c_i, (key, _) in enumerate(FIELDS, start=2):
-            val = res[key].value
-            cell = ws.cell(row=r_i, column=c_i,
-                           value=val[:2000] if val else NOT_FOUND)
-            if res[key].flag == "NOT FOUND":
-                cell.fill = red
-            elif res[key].flag:
-                cell.fill = amber
-        ws.cell(row=r_i, column=len(headers),
-                value=(f"{len(flags)} field(s): " +
-                       ", ".join(f.split(". ", 1)[-1] for f in flags))
-                if flags else "clean")
-        for c in range(1, len(headers) + 1):
-            ws.cell(row=r_i, column=c).alignment = wrap
-            ws.cell(row=r_i, column=c).border = box
-        ws.row_dimensions[r_i].height = 150
+        crm_row = {h: "" for h in headers}
+        
+        # Hardcoded defaults based on user template
+        crm_row['Pipeline Owner.id'] = 'zcrm_1227282000000446001'
+        crm_row['Pipeline Owner'] = 'Vegad CA Tushar'
+        crm_row['Created By.id'] = 'zcrm_1227282000000446001'
+        crm_row['Created By'] = 'Vegad CA Tushar'
+        crm_row['Modified By.id'] = 'zcrm_1227282000000446001'
+        crm_row['Modified By'] = 'Vegad CA Tushar'
+        crm_row['Layout.id'] = 'zcrm_1227282000000453106'
+        crm_row['Layout'] = 'Tenders'
+        crm_row['Stage'] = 'Yet to Decide'
+        crm_row['Pipeline'] = 'Sales Pipeline Standard'
+        
+        def _val(k):
+            v = res.get(k)
+            if v and v.value and not str(v.value).upper().startswith("NOT FOUND"):
+                return str(v.value).strip()
+            return ""
+            
+        crm_row['Pipeline Name'] = _val('Tender Name')
+        crm_row['Amount'] = _val('Tender Estimated Cost')
+        crm_row['EMD Amount'] = _val('Tender EMD')
+        crm_row['Amount of Tender Fees'] = _val('Tender Fees')
+        crm_row['Date of Submission'] = _val('Tender Submission Date')
+        
+        loc = _val('Location / Address')
+        crm_row['State'] = loc
+        crm_row['City Name'] = loc
+        
+        name_val = _val('Tender Name')
+        if "GEM/" in name_val.upper():
+            try:
+                crm_row['Tender No.'] = "GEM/" + name_val.upper().split("GEM/")[1].split(" ")[0].strip()
+            except Exception:
+                crm_row['Tender No.'] = name_val
+        elif "-" in name_val:
+            crm_row['Tender No.'] = name_val.split("-")[0].strip()
+            
+        desc_parts = []
+        for f in ['Purpose / Audit Type', 'Scope of Work', 'Eligibility Criteria', 'Penalty', 'Tender SD']:
+            v = _val(f)
+            if v:
+                desc_parts.append(f"{f}:\n{v}")
+        crm_row['Description'] = "\n\n".join(desc_parts)
 
-    widths = [18, 30, 26, 24, 16, 20, 20, 46, 52, 34, 20, 20, 18, 24, 30]
-    for i, w in enumerate(widths[:len(headers)], start=1):
-        ws.column_dimensions[get_column_letter(i)].width = w
+        for c_i, header in enumerate(headers, start=1):
+            val = crm_row[header]
+            cell = ws.cell(row=r_i, column=c_i, value=val[:30000] if val else "")
+            cell.alignment = wrap
+            cell.border = box
+        ws.row_dimensions[r_i].height = 100
+
     ws.freeze_panes = "B2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(2, len(rows) + 1)}"
 
     # ---- Sheet 2: Evidence -----------------------------------------------
     ev = wb.create_sheet("Evidence")
