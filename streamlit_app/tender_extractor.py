@@ -1609,10 +1609,11 @@ def _gemini_client():
 
 
 def _corpus(pages: list[Page]) -> str:
-    # Prioritize real tender documents over boilerplate general conditions
+    # Always exclude boilerplate general conditions to prevent the AI from hallucinating generic clauses
     real_pages = [p for p in pages if not p.boilerplate]
-    boiler_pages = [p for p in pages if p.boilerplate]
-    sorted_pages = _ordered_pages(real_pages) + _ordered_pages(boiler_pages)
+    
+    # If for some reason the tender ONLY has boilerplate, we fall back to it, but normally we ignore it
+    sorted_pages = _ordered_pages(real_pages if real_pages else pages)
 
     parts = []
     for pg in sorted_pages:
@@ -1749,13 +1750,7 @@ def _merge_ai(results: list[dict]) -> dict[str, Cand]:
             elif cur.conf == "not_found":
                 merged[key] = cand
             elif key in PROSE_FIELDS:
-                if val not in cur.value and cur.value not in val:
-                    merged[key] = Cand(
-                        cur.value + "\n\n[...]\n\n" + val,
-                        cur.ref + ", " + cand.ref if cand.ref not in cur.ref else cur.ref,
-                        cur.conf
-                    )
-                elif len(val) > len(cur.value):
+                if len(val) > len(cur.value):
                     merged[key] = cand
             elif rank[cand.conf] > rank.get(cur.conf, 0):
                 merged[key] = cand
