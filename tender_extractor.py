@@ -1749,7 +1749,13 @@ def _merge_ai(results: list[dict]) -> dict[str, Cand]:
             elif cur.conf == "not_found":
                 merged[key] = cand
             elif key in PROSE_FIELDS:
-                if len(val) > len(cur.value):
+                if val not in cur.value and cur.value not in val:
+                    merged[key] = Cand(
+                        cur.value + "\n\n[...]\n\n" + val,
+                        cur.ref + ", " + cand.ref if cand.ref not in cur.ref else cur.ref,
+                        cur.conf
+                    )
+                elif len(val) > len(cur.value):
                     merged[key] = cand
             elif rank[cand.conf] > rank.get(cur.conf, 0):
                 merged[key] = cand
