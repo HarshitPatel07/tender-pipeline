@@ -1440,10 +1440,13 @@ def _rules_pass(pages: list[Page], folder_name: str) -> dict[str, Cand]:
         log(f"   read tender summary sheet ({len(summary)} field(s))")
     for f, cand in summary.items():
         cur = out.get(f) or Cand()
+        is_missing = not cur.value or str(cur.value).upper().startswith("NOT FOUND")
         if f in ("eligibility", "scope_of_work", "penalty"):
-            if not cur.value:
+            if is_missing:
                 out[f] = cand
-        elif not cur.value or cur.conf != "high":
+            elif cand.value and len(str(cand.value)) > len(str(cur.value)) + 50:
+                out[f] = cand
+        elif is_missing or cur.conf != "high":
             out[f] = cand
 
     if not out["tender_name"].value:
