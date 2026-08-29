@@ -1384,6 +1384,21 @@ tender_fees, submission_date
 """
 
 
+# An account can expose dozens of models, most of which cannot read a tender:
+# image and speech generators, embedders, and preview builds that answer 503
+# far more often than they answer. Every one tried costs a failed request, and
+# with backoff between them that is minutes of waiting for nothing.
+UNUSABLE_MODEL_RE = re.compile(
+    r"embedding|aqa|image|vision|tts|audio|speech|video|omni|live|preview|"
+    r"gemma|learnlm|exp-|-exp\b", re.I)
+
+MAX_MODEL_CANDIDATES = 4
+
+
+def _unusable_model(name: str) -> bool:
+    return bool(UNUSABLE_MODEL_RE.search(name))
+
+
 def _gemini_client():
     """Build a Gemini client and pick a model this key can actually use.
 
@@ -1413,15 +1428,18 @@ def _gemini_client():
             if actions and "generateContent" not in actions:
                 continue
             name = (getattr(m, "name", "") or "").replace("models/", "")
-            if name and "embedding" not in name and "aqa" not in name:
+            if name and not _unusable_model(name):
                 candidates.append(name)
     except Exception as e:
         log(f"   - could not list models ({str(e)[:70]})")
 
     if candidates:
-        # Prefer flash: fastest and most generous on the free tier.
+        # Prefer flash: fastest and most generous on the free tier. Keep only
+        # a short head of the list - walking every model an account exposes
+        # costs a failed request each, and with backoff that is minutes.
         candidates.sort(key=lambda n: (0 if "flash" in n else 1, len(n)))
-        log(f"   {len(candidates)} model(s) available to this key")
+        candidates = candidates[:MAX_MODEL_CANDIDATES]
+        log(f"   trying: {', '.join(candidates)}")
     else:
         candidates = list(CONFIG.get("gemini_models") or [])
         log(f"   falling back to configured models: {', '.join(candidates)}")
@@ -1510,6 +1528,7 @@ def _call_gemini(client, models: list[str], prompt: str) -> dict:
     for rnd in range(CONFIG["gemini_retries"]):
         if not live:
             break
+        quota_hit = False
         for model in list(live):
             try:
                 resp = client.models.generate_content(
@@ -1535,18 +1554,23 @@ def _call_gemini(client, models: list[str], prompt: str) -> dict:
                         models.remove(model)
                     continue
                 if _rate_limited(msg):
+                    # The free-tier quota is shared across models, so once it
+                    # is hit every other model is limited too. Walking the
+                    # rest of the list sleeps once per model and buys nothing;
+                    # stop the round and wait a single time instead.
                     log(f"   - free-tier quota hit on {model}; "
-                        f"waiting {delay}s (quota is shared across models)")
-                    time.sleep(delay)
-                    delay = min(delay * 2, 120)
-                    continue
+                        f"quota is shared, so pausing rather than "
+                        f"trying the others")
+                    quota_hit = True
+                    break
                 log(f"   ! {model} failed: {msg[:120]}")
                 continue
         # Every model was busy this round - Google's side is genuinely loaded.
         if rnd < CONFIG["gemini_retries"] - 1:
-            log(f"     all models busy; waiting {delay}s before round {rnd + 2}")
+            why = "quota" if quota_hit else "all models busy"
+            log(f"     {why}; waiting {delay}s before round {rnd + 2}")
             time.sleep(delay)
-            delay = min(delay * 2, 120)
+            delay = min(delay * 2, 60)
     log("   ! AI layer gave up on this chunk - rules-layer values will be used, "
         "and this tender will NOT be cached so a re-run retries it")
     return {}
@@ -1593,6 +1617,16 @@ def ai_extract(pages: list[Page], client, models):
         log(f"   Gemini pass {n}/{len(chunks)} ({len(ch):,} chars)")
         results.append(_call_gemini(client, models, PROMPT_HEADER +
                                     "\n\n===== DOCUMENTS =====\n" + ch))
+        # A tender pack is mostly boilerplate - standard conditions, forms and
+        # annexures holding none of the 13 fields. Once every field has been
+        # read there is nothing left for the later passes to find, and each one
+        # costs a request against a shared free-tier quota.
+        if n < len(chunks):
+            missing = [k for k, _ in FIELDS if k not in _merge_ai(results)]
+            if not missing:
+                log(f"     all 13 fields found; skipping "
+                    f"{len(chunks) - n} remaining pass(es)")
+                break
     ai_ok = any(bool(r) for r in results)
     return _merge_ai(results), ai_ok
 
