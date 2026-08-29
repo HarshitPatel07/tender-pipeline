@@ -317,6 +317,7 @@ class Page:
     page: int          # 1-based page / sheet number (0 = whole file)
     text: str
     ocr: bool = False
+    boilerplate: bool = False   # standing contract conditions, not this bid
 
     @property
     def ref(self) -> str:
@@ -468,6 +469,48 @@ PRIORITY_HINTS = [
 def file_priority(name: str) -> int:
     n = name.lower()
     return max((w for k, w in PRIORITY_HINTS if k in n), default=50)
+
+
+# A tender pack usually includes the department's standing contract
+# conditions - "Instructions to Bidders", "General Conditions of Contract" -
+# reissued unchanged with every tender it floats. They describe the
+# department's business in general, not this assignment, so every field taken
+# from them is wrong in a way that reads as confident and specific: NTPC's
+# registered office in New Delhi instead of the audit site in Maharashtra,
+# "construction, erection and commissioning of power projects" instead of a
+# statutory audit, a fatal-injury penalty instead of an audit penalty.
+#
+# They are also long, and named things like TENDER.pdf that score highly on
+# file name alone, so they were being read first and winning every field.
+BOILERPLATE_RE = re.compile(
+    r"INSTRUCTIONS?\s+TO\s+BIDDERS|GENERAL\s+CONDITIONS\s+OF\s+CONTRACT|"
+    r"TABLE\s+OF\s+CLAUSES|CONDITIONS\s+OF\s+CONTRACT\s+FOR|"
+    r"STANDARD\s+(?:BIDDING|TENDER)\s+DOCUMENT", re.I)
+
+
+def mark_boilerplate(pages: list[Page]) -> int:
+    """Flag files that are the department's standing conditions, not this bid.
+
+    Judged on the opening pages: a genuine tender may cite these documents in
+    passing, but only the template itself leads with them.
+    """
+    by_file: dict[str, list[Page]] = {}
+    for p in pages:
+        by_file.setdefault(p.file, []).append(p)
+
+    flagged = 0
+    for fname, fpages in by_file.items():
+        head = sorted(fpages, key=lambda p: p.page)[:3]
+        hits = sum(1 for p in head if BOILERPLATE_RE.search(p.text or ""))
+        # One mention could be a reference; leading with it twice, or in a
+        # document this long, means the file *is* the standing conditions.
+        if hits >= 2 or (hits and len(fpages) >= 50):
+            for p in fpages:
+                p.boilerplate = True
+            flagged += 1
+            log(f"   note: {fname} looks like standard contract conditions, "
+                f"not this tender - used only to fill gaps")
+    return flagged
 
 
 # --------------------------------------------------------------------------
@@ -769,8 +812,15 @@ ELIG_BREAK_RE = re.compile(
 
 
 def _ordered_pages(pages: list[Page]) -> list[Page]:
-    """Read the documents most likely to carry the facts first."""
-    return sorted(pages, key=lambda p: (-file_priority(p.file), p.file, p.page))
+    """Read the documents most likely to carry the facts first.
+
+    Standing contract conditions go last whatever their file name scores:
+    TENDER.pdf matches the "tender" hint and outranked the real documents,
+    which is how a 438-page O&M template came to supply seven of thirteen
+    fields at high confidence.
+    """
+    return sorted(pages, key=lambda p: (p.boilerplate,
+                                        -file_priority(p.file), p.file, p.page))
 
 
 class _Block:
@@ -1252,6 +1302,26 @@ def summary_sheet_extract(pages: list[Page]) -> dict[str, Cand]:
 
 
 def rules_extract(pages: list[Page], folder_name: str) -> dict[str, Cand]:
+    # Read the tender's own documents first. Only if a field is still missing
+    # is the standing-conditions template consulted, and what it yields is
+    # marked low and labelled, because it describes the department's standard
+    # terms rather than this assignment.
+    real = [p for p in pages if not p.boilerplate]
+    if real and len(real) != len(pages):
+        out = _rules_pass(real, folder_name)
+        fallback = _rules_pass(pages, folder_name)
+        for key, cand in fallback.items():
+            if not out.get(key, Cand()).value and cand.value:
+                cand.conf = "low"
+                cand.value = (cand.value.rstrip()
+                              + "\n\n[from the standard contract conditions, "
+                                "not this tender - verify]")
+                out[key] = cand
+        return out
+    return _rules_pass(pages, folder_name)
+
+
+def _rules_pass(pages: list[Page], folder_name: str) -> dict[str, Cand]:
     out: dict[str, Cand] = {}
 
     for f in MONEY_FIELDS:
@@ -1964,6 +2034,7 @@ def process_tender(name: str, files: list[Path], client, models) -> dict:
 
     total_chars = sum(len(p.text) for p in pages)
     log(f"   {len(pages)} page(s), {total_chars:,} characters of text")
+    mark_boilerplate(pages)
     rules = rules_extract(pages, name)
     ai, ai_ok = ai_extract(pages, client, models)
     # A key was supplied but no model could be reached: that is a transient
