@@ -1511,49 +1511,57 @@ def _unusable_model(name: str) -> bool:
 def _call_groq(api_key: str, models: list[str], prompt: str) -> dict:
     """Call Groq API with automatic model failover (120B -> 27B -> compound)."""
     import requests
+    import time
 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    for model in models:
-        try:
-            r = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers=headers,
-                json={
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are an expert chartered accountant and Indian government "
-                                "tender analyst. Extract the requested fields strictly in JSON "
-                                "format adhering precisely to the JSON schema provided."
-                            ),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.0,
-                },
-                timeout=60,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                parsed = _parse_json(content)
-                if parsed:
-                    log(f"     Groq AI succeeded on {model}")
-                    return parsed
-            elif r.status_code == 429:
-                log(f"   - Groq model {model} rate limited, trying next model")
+    for attempt in range(2):
+        for model in ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "groq/compound", "openai/gpt-oss-20b"]:
+            try:
+                r = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": model,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are an expert chartered accountant and Indian government "
+                                    "tender analyst. Extract the requested fields strictly in JSON "
+                                    "format adhering precisely to the JSON schema provided."
+                                ),
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0.0,
+                    },
+                    timeout=60,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    parsed = _parse_json(content)
+                    if parsed:
+                        log(f"     Groq AI succeeded on {model}")
+                        return parsed
+                elif r.status_code == 429:
+                    log(f"   - Groq model {model} rate limited, waiting 3s...")
+                    time.sleep(3)
+                    continue
+                else:
+                    log(f"   ! Groq {model} returned status {r.status_code}: {r.text[:80]}")
+            except Exception as e:
+                log(f"   ! Groq {model} exception: {str(e)[:80]}")
                 continue
-            else:
-                log(f"   ! Groq {model} returned status {r.status_code}: {r.text[:80]}")
-        except Exception as e:
-            log(f"   ! Groq {model} exception: {str(e)[:80]}")
-            continue
+        # If all models failed in this attempt due to rate limits, wait a bit longer before trying the whole list again
+        if attempt == 0:
+            log("   ! All Groq models rate limited. Waiting 10s before final retry pass...")
+            time.sleep(10)
+            
     return {}
 
 
