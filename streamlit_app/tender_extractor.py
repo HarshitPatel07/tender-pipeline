@@ -1582,9 +1582,22 @@ def _gemini_client():
 
     try:
         client = genai.Client(api_key=key)
-        candidates = list(CONFIG.get("gemini_models") or [
-            "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"
-        ])
+        
+        # Dynamically fetch available models to avoid trying unavailable ones
+        try:
+            available = [
+                m.name.replace("models/", "") 
+                for m in client.models.list() 
+                if "flash" in m.name.lower() and "vision" not in m.name.lower()
+            ]
+            candidates = sorted(available, reverse=True)
+            if not candidates:
+                raise ValueError("No flash models found")
+        except Exception:
+            candidates = list(CONFIG.get("gemini_models") or [
+                "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"
+            ])
+            
         for model in candidates:
             try:
                 client.models.generate_content(model=model, contents="ping")
