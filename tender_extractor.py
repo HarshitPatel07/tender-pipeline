@@ -905,6 +905,12 @@ def _text_value(window: str) -> str:
     # "Consignees/Reporting Officer" and capturing the leftover "s/Reporting...".
     if re.match(r"^[a-z]{1,3}\s*[/)\]]", first):
         return ""
+    # The label was a word inside a sentence, not a field, so what follows is
+    # the rest of that clause. "...at the tender opening location, before the
+    # deadline for submission of bids..." was reported as tender 2026-9533's
+    # address. A real value never opens mid-clause.
+    if re.match(r"^[,;]", first):
+        return ""
     if _is_junk_line(first):
         return ""
     parts = [first]
@@ -964,8 +970,25 @@ def _value_is_weak(field: str, value: str) -> bool:
 
 def _line_anchored(text: str, start: int, end: int) -> bool:
     """True if the label starts its own line, or is immediately followed by ':'."""
+    # A label followed by a comma is a word in a sentence, not a field. PDF
+    # extraction wraps lines mid-sentence, so "at the tender opening\nlocation,
+    # before the deadline..." puts a bare "location" at the start of a line and
+    # looks exactly like a heading; that fragment was reported as tender
+    # 2026-9533's address.
+    after = text[end:end + 1]
+    if after == ",":
+        return False
     bol = text.rfind("\n", 0, start) + 1
     if re.fullmatch(r"[\s\u2022*\-]*(?:\d+(?:\.\d+)*[).]?\s*)?", text[bol:start]):
+        # Only a genuine line start counts. If the previous line runs on
+        # without terminal punctuation, this is a wrapped sentence.
+        prev_end = bol - 1
+        if prev_end > 0:
+            prev = text.rfind("\n", 0, prev_end) + 1
+            prev_line = text[prev:prev_end].rstrip()
+            if prev_line and prev_line[-1] not in ".:;?!)]" and \
+                    text[start:end].islower():
+                return False
         return True
     return ":" in text[end:end + 3]
 
