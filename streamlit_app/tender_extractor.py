@@ -386,6 +386,7 @@ _OCR_WARNED = False
 def _ocr_page(pg) -> str:
     global _OCR_WARNED
     try:
+        # pyrefly: ignore [missing-import]
         import pytesseract
         from PIL import Image
         import fitz
