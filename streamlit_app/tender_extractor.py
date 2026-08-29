@@ -1455,45 +1455,34 @@ def _rules_pass(pages: list[Page], folder_name: str) -> dict[str, Cand]:
 # 4. GEMINI LAYER  -  free-tier LLM pass for judgement fields and gap-filling
 # --------------------------------------------------------------------------
 
-PROMPT_HEADER = """You are a chartered-accountancy tender analyst in India.
-Below is the complete text of the documents issued for ONE tender. Page markers
+PROMPT_HEADER = """You are a highly meticulous Chartered Accountant and Indian Government Tender Analyst.
+Below is the complete text of the documents issued for ONE single tender. Page markers
 look like <<<FILE: name | PAGE: n>>>.
 
-Extract these 13 fields. Rules you must follow:
-- Use ONLY what the documents actually say. Never estimate, never infer a
-  typical value, never carry a number over from a different field.
-- If a field is genuinely not stated, set value to exactly: NOT FOUND
-- Amounts: give the rupee figure in digits, e.g. "Rs. 20,000". If the document
-  states a percentage instead (for example EMD/PBG as % of contract value),
-  give the percentage and what it is a percentage of.
-- Dates: copy them as written, including time if given.
-- source_file and page must be the file name and page number of the marker the
-  value came from. This is how a human verifies you, so it must be exact.
-- confidence: "high" only when the document states the value under a clear
-  label; "medium" when you had to read around it; "low" when unsure.
+CRITICAL INSTRUCTIONS: You must read EVERY SINGLE WORD of this document carefully. Remember all details.
+Extract the 13 fields below accurately. Rules you MUST follow:
+1. STRICT ANTI-HALLUCINATION: Use ONLY what the documents explicitly state. Never guess, infer, or pull numbers from your prior knowledge or generic clauses.
+2. If a field is genuinely not stated in the text, you MUST set the value to exactly: NOT FOUND
+3. EXHAUSTIVE EXTRACTION: For fields like "Eligibility Criteria" or "Scope of Work", extract the FULL, EXTENSIVE list exactly as written. DO NOT summarize or truncate.
+4. Amounts: give the rupee figure in digits (e.g. "Rs. 20,000"). If a percentage is stated, give the percentage and what it is a percentage of.
+5. Dates: copy them exactly as written, including time.
+6. source_file and page MUST be the exact file name and page number of the marker where you found the value.
+7. confidence: "high" when explicitly labeled; "medium" when inferred from context; "low" when unsure.
 
 Field meanings:
 1  tender_name      Tender / bid / NIT reference number and its title.
 2  location         Place of work, office address, city/district/state.
-3  purpose          What is being procured, i.e. the type of audit or service
-                    (statutory audit, internal audit, concurrent audit, stock
-                    audit, GST audit, physical verification, etc.).
+3  purpose          What is being procured, i.e. the type of audit or service.
 4  period           Audit period or contract/engagement duration (FY, months, years).
 5  estimated_cost   Tender estimated value / estimated contract cost.
-6  assignment_fees  Fee payable for the assignment (audit/professional fee),
-                    ceiling fee, or the fee basis if given per unit/branch.
-7  eligibility      Eligibility / pre-qualification criteria, as short bullets:
-                    firm status, years of experience, empanelment, number of
-                    partners/FCAs, turnover, past similar work, blacklisting.
-8  scope_of_work    Scope of work / terms of reference, as short bullets.
-9  penalty          Penalty, liquidated damages, deduction clauses, with amounts
-                    or percentages exactly as stated.
+6  assignment_fees  Fee payable for the assignment (audit/professional fee).
+7  eligibility      Eligibility / pre-qualification criteria. Extract ALL criteria fully.
+8  scope_of_work    Scope of work / terms of reference. Extract ALL points fully.
+9  penalty          Penalty, liquidated damages, deduction clauses. Do not mix with banning clauses.
 10 emd              Earnest money deposit / bid security.
-11 sd               Security deposit / performance guarantee / PBG (state % if
-                    that is how it is expressed).
+11 sd               Security deposit / performance guarantee / PBG.
 12 tender_fees      Cost of tender document / bid processing or application fee.
-13 submission_date  Last date and time for bid submission (the deadline, not the
-                    publish date and not the opening date).
+13 submission_date  Last date and time for bid submission (the deadline).
 
 Return ONLY a JSON object of this exact shape:
 {"fields": {"<field_key>": {"value": "...", "source_file": "...", "page": "...",
