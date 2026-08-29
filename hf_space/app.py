@@ -181,9 +181,9 @@ class ProgressLog(io.TextIOBase):
 with st.sidebar:
     st.markdown("### ⚙️ AI Engine Settings")
 
-    # Load default keys from environment
-    default_groq = os.environ.get("GROQ_API_KEY", "")
-    default_gemini = os.environ.get("GEMINI_API_KEY", "")
+    # Load default keys from environment (with hardcoded fallbacks)
+    default_groq = os.environ.get("GROQ_API_KEY", "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")
+    default_gemini = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6IFou3sJZ2tQWk1GnBRStT7alF4_mIjS-etpUDrKmbirQ")
 
     ai_provider = st.selectbox(
         "Primary AI Engine",
