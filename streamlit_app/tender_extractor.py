@@ -1444,8 +1444,6 @@ def _rules_pass(pages: list[Page], folder_name: str) -> dict[str, Cand]:
         if f in ("eligibility", "scope_of_work", "penalty"):
             if is_missing:
                 out[f] = cand
-            elif cand.value and len(str(cand.value)) > len(str(cur.value)) + 50:
-                out[f] = cand
         elif is_missing or cur.conf != "high":
             out[f] = cand
 
@@ -1865,11 +1863,7 @@ def merge(rules: dict[str, Cand], ai: dict[str, Cand],
 
         is_ai_missing = not a.value or a.value.upper().startswith("NOT FOUND")
         if not is_ai_missing:
-            # If AI found it, but Rules found a massive numbered list for a prose field, trust the Rules!
-            if key in ("eligibility", "scope_of_work", "penalty") and r.value and len(str(r.value)) > len(str(a.value)) + 50:
-                res.value, res.ref, res.conf = r.value, r.ref, r.conf
-            else:
-                res.value, res.ref, res.conf = a.value, (a.ref or r.ref), a.conf
+            res.value, res.ref, res.conf = a.value, (a.ref or r.ref), a.conf
         elif r.value:
             res.value, res.ref, res.conf = r.value, r.ref, r.conf
         else:
