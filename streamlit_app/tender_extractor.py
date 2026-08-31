@@ -2125,9 +2125,57 @@ def write_excel(rows: list[dict], out_path: Path) -> Path:
 
     wb = Workbook()
 
-    # ---- Sheet 1: Zoho CRM Pipeline Import -------------------------------
-    ws = wb.active
-    ws.title = "CRM Import"
+    # ---- Sheet 1: Tender Summary  -----------------------------------------
+    #
+    # Every field this tool extracts, in its own full column, one row per
+    # tender. Restored: the "Update Excel export to match 51-column Zoho CRM
+    # Pipeline format" change replaced this sheet outright with CRM Import,
+    # whose 51 columns are built for one CRM's field names, not for showing
+    # what was actually extracted - Eligibility, Scope, Penalty and SD all
+    # land in one shared "Description" cell there, and Purpose has no column
+    # at all. The data was still being extracted correctly; it just stopped
+    # being written anywhere a person could see it whole. CRM Import stays,
+    # as a second sheet, for pushing straight into Zoho.
+    ts = wb.active
+    ts.title = "Tender Summary"
+    ts_headers = ["Tender Folder"] + [label for _, label in FIELDS] + ["Needs Review"]
+    ts.append(ts_headers)
+    for c in range(1, len(ts_headers) + 1):
+        cell = ts.cell(row=1, column=c)
+        cell.fill, cell.font, cell.border = hdr_fill, hdr_font, box
+        cell.alignment = Alignment(wrap_text=True, vertical="center",
+                                   horizontal="center")
+    ts.row_dimensions[1].height = 34
+
+    for r_i, row in enumerate(rows, start=2):
+        res: dict[str, Result] = row["results"]
+        flags = [label for key, label in FIELDS if res[key].flag]
+        ts.cell(row=r_i, column=1, value=row["tender"])
+        for c_i, (key, _) in enumerate(FIELDS, start=2):
+            val = res[key].value
+            cell = ts.cell(row=r_i, column=c_i,
+                           value=val[:4000] if val else NOT_FOUND)
+            if res[key].flag == "NOT FOUND":
+                cell.fill = red
+            elif res[key].flag:
+                cell.fill = amber
+        ts.cell(row=r_i, column=len(ts_headers),
+               value=(f"{len(flags)} field(s): " +
+                      ", ".join(f.split(". ", 1)[-1] for f in flags))
+               if flags else "clean")
+        for c in range(1, len(ts_headers) + 1):
+            ts.cell(row=r_i, column=c).alignment = wrap
+            ts.cell(row=r_i, column=c).border = box
+        ts.row_dimensions[r_i].height = 150
+
+    ts_widths = [18, 30, 26, 24, 16, 20, 20, 46, 52, 34, 20, 20, 18, 24, 30]
+    for i, w in enumerate(ts_widths[:len(ts_headers)], start=1):
+        ts.column_dimensions[get_column_letter(i)].width = w
+    ts.freeze_panes = "B2"
+    ts.auto_filter.ref = f"A1:{get_column_letter(len(ts_headers))}{max(2, len(rows) + 1)}"
+
+    # ---- Sheet 2: Zoho CRM Pipeline Import -------------------------------
+    ws = wb.create_sheet("CRM Import")
     headers = [
         'Pipeline Id', 'Pipeline Owner.id', 'Pipeline Owner', 'Amount', 'Pipeline Name', 
         'Closing Date', 'Company Name.id', 'Company Name', 'Stage', 'Type', 'Lead Source', 
