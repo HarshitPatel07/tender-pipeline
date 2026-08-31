@@ -2298,11 +2298,19 @@ def write_excel(rows: list[dict], out_path: Path) -> Path:
         if is_gem:
             crm_row['Tender Selection Method'] = 'GeM'
             
+        # Every one of the 13 fields must land somewhere in this sheet, not
+        # just the ones with a matching Zoho column. Period and Assignment
+        # Fees have no dedicated CRM field - the fixed 51-column template
+        # doesn't define one - and were being dropped from this sheet
+        # entirely: present in Tender Summary, absent here. Added alongside
+        # Tender SD, which already lived here for the same reason.
         desc_parts = []
-        for f, label in [('purpose', 'Purpose / Audit Type'), 
-                         ('scope_of_work', 'Scope of Work'), 
-                         ('eligibility', 'Eligibility Criteria'), 
-                         ('penalty', 'Penalty'), 
+        for f, label in [('purpose', 'Purpose / Audit Type'),
+                         ('period', 'Period'),
+                         ('scope_of_work', 'Scope of Work'),
+                         ('eligibility', 'Eligibility Criteria'),
+                         ('assignment_fees', 'Assignment Fees'),
+                         ('penalty', 'Penalty'),
                          ('sd', 'Tender SD')]:
             v = _val(f)
             if v:
