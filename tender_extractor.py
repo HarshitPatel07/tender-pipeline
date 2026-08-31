@@ -1873,6 +1873,32 @@ def _is_junk_money_answer(v: str) -> bool:
     return not re.search(r"\d", v)
 
 
+def _strip_echoed_heading(value: str, key: str) -> str:
+    """Drop a leading line that just repeats the section's own heading.
+
+    Seen on tender 2026-9533: the AI layer answered scope_of_work with
+    "Scope of Work\n\nStatutory audit of ash disposal...", echoing the
+    document's own heading before the actual content. The CRM sheet's
+    Description block then prepends its own "Scope of Work:" label,
+    producing a visible "Scope of Work:\nScope of Work\n\n..." duplicate.
+    Reuses the exact patterns _capture_section anchors on for this field, so
+    it recognises whichever heading wording this tender's documents used,
+    and only ever strips a short leading line - real content never matches.
+    """
+    pats = SECTION_HEADINGS.get(key)
+    if not pats or not value:
+        return value
+    first, _, rest = value.partition("\n")
+    first = first.strip()
+    if len(first) > 70:
+        return value
+    for pat in pats:
+        m = re.match(pat, first, re.I)
+        if m and len(first) - len(m.group(0)) <= 25:
+            return rest.lstrip("\n")
+    return value
+
+
 def merge(rules: dict[str, Cand], ai: dict[str, Cand],
           ai_ran: bool = True) -> dict[str, Result]:
     out: dict[str, Result] = {}
@@ -1894,6 +1920,9 @@ def merge(rules: dict[str, Cand], ai: dict[str, Cand],
             res.flag = "NOT FOUND"
             out[key] = res
             continue
+
+        if key in SECTION_HEADINGS:
+            res.value = _strip_echoed_heading(res.value, key)
 
         # Cross-check the money and date fields: two independent readers.
         if key in MONEY_FIELDS and r.value and a.value:
