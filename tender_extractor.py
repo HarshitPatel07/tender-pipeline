@@ -2282,7 +2282,8 @@ def write_excel(rows: list[dict], out_path: Path) -> Path:
         crm_row['State'] = state
         
         name_val = _val('tender_name')
-        if "GEM/" in name_val.upper():
+        is_gem = "GEM/" in name_val.upper()
+        if is_gem:
             try:
                 crm_row['Tender No.'] = "GEM/" + name_val.upper().split("GEM/")[1].split(" ")[0].strip()
             except Exception:
@@ -2291,6 +2292,11 @@ def write_excel(rows: list[dict], out_path: Path) -> Path:
             crm_row['Tender No.'] = name_val.split("-")[0].strip()
         else:
             crm_row['Tender No.'] = name_val
+
+        # The one CRM field derivable with certainty rather than fabricated:
+        # the tender number's own format states the portal it was floated on.
+        if is_gem:
+            crm_row['Tender Selection Method'] = 'GeM'
             
         desc_parts = []
         for f, label in [('purpose', 'Purpose / Audit Type'), 
