@@ -312,13 +312,19 @@ if btn_extract:
             standalone=True,
             stamp="Extracted on " + time.strftime("%d %b %Y, %H:%M"),
         )
-        xlsx_file = Path("Tender_Summary.xlsx")
-        xlsx_data = xlsx_file.read_bytes() if xlsx_file.exists() else None
+        # Two separate files, not one bundle a user has to open and find the
+        # right tab in: the 13-field report on its own, and the CRM sheet on
+        # its own, clean enough to hand straight to Zoho's bulk importer.
+        summary_path = te.write_tender_summary_xlsx(
+            te.LAST_ROWS, Path("Tender_Summary_Report.xlsx"))
+        crm_path = te.write_crm_import_xlsx(
+            te.LAST_ROWS, Path("CRM_Import.xlsx"))
 
         st.session_state.result = {
             "rows": te.LAST_ROWS,
             "dash_html": dash_html,
-            "excel_bytes": xlsx_data,
+            "summary_bytes": summary_path.read_bytes(),
+            "crm_bytes": crm_path.read_bytes(),
             "log": progress_log.getvalue(),
         }
         progress_container.empty()
@@ -331,7 +337,8 @@ if st.session_state.result:
     res = st.session_state.result
     rows = res.get("rows", [])
     dash_html = res.get("dash_html", "")
-    excel_bytes = res.get("excel_bytes")
+    summary_bytes = res.get("summary_bytes")
+    crm_bytes = res.get("crm_bytes")
     log_text = res.get("log", "")
 
     st.markdown("---")
@@ -375,18 +382,32 @@ if st.session_state.result:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Action Toolbar
-    col_dl1, col_dl2, _ = st.columns([1.5, 1.5, 3])
+    # Action Toolbar - the two extracted-data files as separate downloads,
+    # not one bundle a user has to open and pick the right tab from.
+    col_dl1, col_dl2, col_dl3 = st.columns([1.5, 1.5, 1.5])
     with col_dl1:
-        if excel_bytes:
+        if summary_bytes:
             st.download_button(
-                label="📥 Download Excel (.xlsx)",
-                data=excel_bytes,
-                file_name="Tender_Summary.xlsx",
+                label="📥 13-Field Report (.xlsx)",
+                data=summary_bytes,
+                file_name="Tender_Summary_Report.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
+                help="Every extracted field, full text, one row per tender, "
+                     "plus the Evidence and Documents Read sheets.",
             )
     with col_dl2:
+        if crm_bytes:
+            st.download_button(
+                label="📥 CRM Import (.xlsx)",
+                data=crm_bytes,
+                file_name="CRM_Import.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                help="Just the Zoho Pipeline import sheet - no other tabs "
+                     "to remove before uploading.",
+            )
+    with col_dl3:
         if dash_html:
             st.download_button(
                 label="🌐 Download Dashboard (.html)",

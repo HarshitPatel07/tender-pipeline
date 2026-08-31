@@ -2139,7 +2139,14 @@ LEGEND = [
 ]
 
 
-def write_excel(rows: list[dict], out_path: Path) -> Path:
+def write_excel(rows: list[dict], out_path: Path,
+                 sheets: set[str] | None = None) -> Path:
+    """Write the workbook. `sheets=None` (the default) writes all five, as
+    every caller before this expected. Pass a subset to get just those
+    sheets in one file - used to offer the 13-field report and the CRM
+    import as two separate downloads instead of one bundle each user has
+    to open and pick a tab from.
+    """
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
@@ -2165,8 +2172,7 @@ def write_excel(rows: list[dict], out_path: Path) -> Path:
     # at all. The data was still being extracted correctly; it just stopped
     # being written anywhere a person could see it whole. CRM Import stays,
     # as a second sheet, for pushing straight into Zoho.
-    ts = wb.active
-    ts.title = "Tender Summary"
+    ts = wb.create_sheet("Tender Summary")
     ts_headers = ["Tender Folder"] + [label for _, label in FIELDS] + ["Needs Review"]
     ts.append(ts_headers)
     for c in range(1, len(ts_headers) + 1):
@@ -2382,9 +2388,37 @@ def write_excel(rows: list[dict], out_path: Path) -> Path:
     rm.column_dimensions["A"].width = 28
     rm.column_dimensions["B"].width = 92
 
+    # Every sheet was built above regardless of `sheets`, so nothing in that
+    # logic needed touching. Pruning here - after the fact - is what lets a
+    # caller get a clean CRM-only file (for a direct Zoho import, which
+    # should not carry unrelated tabs) or a 13-field-only report, without
+    # duplicating any of the sheet-building code.
+    all_titles = ("Tender Summary", "CRM Import", "Evidence",
+                  "Documents Read", "Read Me")
+    if sheets is not None:
+        for title in all_titles:
+            if title not in sheets and title in wb.sheetnames:
+                del wb[title]
+    if "Sheet" in wb.sheetnames and len(wb.sheetnames) > 1:
+        del wb["Sheet"]
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(out_path))
     return out_path
+
+
+def write_tender_summary_xlsx(rows: list[dict], out_path: Path) -> Path:
+    """The human-readable 13-field report on its own: Tender Summary, plus
+    Evidence and Documents Read for traceability, and Read Me."""
+    return write_excel(rows, out_path,
+                       sheets={"Tender Summary", "Evidence",
+                               "Documents Read", "Read Me"})
+
+
+def write_crm_import_xlsx(rows: list[dict], out_path: Path) -> Path:
+    """Just the CRM Import sheet - clean for a direct Zoho bulk import,
+    with no unrelated tabs to strip out first."""
+    return write_excel(rows, out_path, sheets={"CRM Import"})
 
 
 # --------------------------------------------------------------------------
