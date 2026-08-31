@@ -9,3 +9,8 @@ requests
 pytesseract
 pillow
 google-genai
+
+# A code-only push can be hot-synced by the host without restarting the
+# Python process, so an already-imported module can keep missing a function
+# that genuinely exists in the file on disk - exactly what happened after
+# the split-download change. Touching this file forces a full rebuild.

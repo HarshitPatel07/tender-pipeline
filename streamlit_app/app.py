@@ -315,16 +315,33 @@ if btn_extract:
         # Two separate files, not one bundle a user has to open and find the
         # right tab in: the 13-field report on its own, and the CRM sheet on
         # its own, clean enough to hand straight to Zoho's bulk importer.
-        summary_path = te.write_tender_summary_xlsx(
-            te.LAST_ROWS, Path("Tender_Summary_Report.xlsx"))
-        crm_path = te.write_crm_import_xlsx(
-            te.LAST_ROWS, Path("CRM_Import.xlsx"))
+        #
+        # Guarded with hasattr: a code-only push can leave a cloud host's
+        # already-running process holding an older, already-imported copy of
+        # this module, so `te` briefly lacks a function that genuinely exists
+        # in the file on disk (fixed by that host restarting the process; a
+        # crash here just makes the symptom confusing). If that happens,
+        # fall back to the single bundled workbook rather than hard-failing
+        # the whole page.
+        if hasattr(te, "write_tender_summary_xlsx") and hasattr(te, "write_crm_import_xlsx"):
+            summary_path = te.write_tender_summary_xlsx(
+                te.LAST_ROWS, Path("Tender_Summary_Report.xlsx"))
+            crm_path = te.write_crm_import_xlsx(
+                te.LAST_ROWS, Path("CRM_Import.xlsx"))
+            summary_bytes = summary_path.read_bytes()
+            crm_bytes = crm_path.read_bytes()
+        else:
+            bundle_path = te.write_excel(
+                te.LAST_ROWS, Path("Tender_Summary.xlsx"))
+            bundle_bytes = bundle_path.read_bytes()
+            summary_bytes = bundle_bytes
+            crm_bytes = bundle_bytes
 
         st.session_state.result = {
             "rows": te.LAST_ROWS,
             "dash_html": dash_html,
-            "summary_bytes": summary_path.read_bytes(),
-            "crm_bytes": crm_path.read_bytes(),
+            "summary_bytes": summary_bytes,
+            "crm_bytes": crm_bytes,
             "log": progress_log.getvalue(),
         }
         progress_container.empty()
