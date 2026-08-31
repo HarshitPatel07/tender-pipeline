@@ -1853,6 +1853,26 @@ def _num(text: str) -> float | None:
     return val
 
 
+def _is_junk_money_answer(v: str) -> bool:
+    """True when an AI answer for a money field is not actually an answer.
+
+    Making AI compulsory meant its non-empty value always wins, with no
+    check on whether that value was usable. On tender 2026-9533 the AI
+    returned the bare word "No" for both EMD and Security Deposit - not a
+    number, not one of the recognised nil phrases ("Not Applicable", "Nil",
+    "Exempted") - and it silently overwrote the rules layer's correct "Not
+    Applicable", because "No" is non-empty and does not start with
+    "NOT FOUND". A money field's value must contain a figure or a genuine
+    nil statement; anything else is a non-answer.
+    """
+    v = (v or "").strip()
+    if not v:
+        return True
+    if EXPLICIT_NIL_RE.search(v):
+        return False
+    return not re.search(r"\d", v)
+
+
 def merge(rules: dict[str, Cand], ai: dict[str, Cand],
           ai_ran: bool = True) -> dict[str, Result]:
     out: dict[str, Result] = {}
@@ -1862,6 +1882,9 @@ def merge(rules: dict[str, Cand], ai: dict[str, Cand],
         res = Result(rules_value=r.value, ai_value=a.value)
 
         is_ai_missing = not a.value or a.value.upper().startswith("NOT FOUND")
+        if key in MONEY_FIELDS and not is_ai_missing \
+                and _is_junk_money_answer(a.value):
+            is_ai_missing = True
         if not is_ai_missing:
             res.value, res.ref, res.conf = a.value, (a.ref or r.ref), a.conf
         elif r.value:
@@ -1902,6 +1925,154 @@ def merge(rules: dict[str, Cand], ai: dict[str, Cand],
             res.flag = "from OCR - verify digits"
         out[key] = res
     return out
+
+
+# --------------------------------------------------------------------------
+# 5b. GEOGRAPHY  -  split a free-text location into a City and a State
+# --------------------------------------------------------------------------
+#
+# The CRM sheet has separate City Name and State columns, but every address
+# the engine reads is one free-text blob - "1045-Solapur STPP, Solapur STPP,
+# AT-FATATEWADI, PO-HOTGI STATION, SOUTH SOLAPUR, SOLAPUR, Maharashtra-413215"
+# or, once the AI layer is compulsory and prefers brevity, just "Solapur".
+# Dumping that same blob into both columns is wrong however long or short it
+# is. A state name is looked for directly in the text; a city is looked up
+# against a gazetteer of major Indian cities and PSU/GeM tender towns, which
+# also supplies the state when the tender's own wording never states it - as
+# with the bare "Solapur" case, where no state regex can find anything.
+
+INDIAN_STATES = [
+    "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh",
+    "Goa", "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand", "Karnataka",
+    "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya",
+    "Mizoram", "Nagaland", "Odisha", "Punjab", "Rajasthan", "Sikkim",
+    "Tamil Nadu", "Telangana", "Tripura", "Uttar Pradesh", "Uttarakhand",
+    "West Bengal", "Andaman and Nicobar Islands", "Chandigarh",
+    "Dadra and Nagar Haveli and Daman and Diu", "Jammu and Kashmir",
+    "Ladakh", "Lakshadweep", "Delhi", "Puducherry", "Pondicherry",
+]
+_STATE_RE = re.compile(
+    r"\b(" + "|".join(re.escape(s) for s in
+                      sorted(INDIAN_STATES, key=len, reverse=True)) + r")\b",
+    re.I)
+
+# City -> state, for the district towns and PSU/GeM sites this tool actually
+# sees, plus common alternate spellings (Bangalore/Bengaluru, Sholapur/
+# Solapur, Prayagraj/Allahabad) so a document using either still resolves.
+CITY_STATE: dict[str, str] = {}
+
+
+def _cities(state: str, *names: str) -> None:
+    for n in names:
+        CITY_STATE[n.upper()] = state
+
+
+_cities("Andhra Pradesh", "Visakhapatnam", "Vijayawada", "Guntur", "Tirupati",
+        "Kakinada", "Rajahmundry", "Kurnool", "Nellore", "Anantapur", "Kadapa")
+_cities("Arunachal Pradesh", "Itanagar")
+_cities("Assam", "Guwahati", "Dibrugarh", "Silchar", "Tinsukia", "Jorhat")
+_cities("Bihar", "Patna", "Gaya", "Bhagalpur", "Muzaffarpur", "Barauni")
+_cities("Chhattisgarh", "Raipur", "Bhilai", "Bilaspur", "Korba", "Durg",
+        "Janjgir", "Champa")
+_cities("Goa", "Panaji", "Vasco Da Gama", "Margao")
+_cities("Gujarat", "Ahmedabad", "Surat", "Vadodara", "Rajkot", "Bhavnagar",
+        "Jamnagar", "Gandhinagar", "Bharuch", "Anand", "Kandla", "Dahej",
+        "Hazira", "Mundra", "Vapi")
+_cities("Haryana", "Gurgaon", "Gurugram", "Faridabad", "Panipat", "Karnal",
+        "Hisar", "Rohtak", "Panchkula", "Ambala", "Yamunanagar")
+_cities("Himachal Pradesh", "Shimla", "Solan", "Baddi", "Kullu", "Mandi")
+_cities("Jharkhand", "Ranchi", "Jamshedpur", "Dhanbad", "Bokaro",
+        "Hazaribagh", "Ramgarh")
+_cities("Karnataka", "Bengaluru", "Bangalore", "Mysuru", "Mysore",
+        "Mangaluru", "Mangalore", "Hubli", "Belgaum", "Belagavi",
+        "Gulbarga", "Kalaburagi", "Davangere", "Raichur")
+_cities("Kerala", "Thiruvananthapuram", "Kochi", "Cochin", "Kozhikode",
+        "Calicut", "Thrissur", "Kollam", "Kannur", "Alappuzha")
+_cities("Madhya Pradesh", "Bhopal", "Indore", "Jabalpur", "Gwalior",
+        "Ujjain", "Sagar", "Satna", "Singrauli", "Sidhi")
+_cities("Maharashtra", "Mumbai", "Pune", "Nagpur", "Nashik", "Aurangabad",
+        "Sambhajinagar", "Solapur", "Sholapur", "Kolhapur", "Amravati",
+        "Nanded", "Thane", "Navi Mumbai", "Chandrapur", "Latur", "Akola",
+        "Jalgaon", "Ratnagiri")
+_cities("Manipur", "Imphal")
+_cities("Meghalaya", "Shillong")
+_cities("Mizoram", "Aizawl")
+_cities("Nagaland", "Kohima", "Dimapur")
+_cities("Odisha", "Bhubaneswar", "Cuttack", "Rourkela", "Sambalpur",
+        "Paradip", "Angul", "Talcher", "Jharsuguda", "Berhampur")
+_cities("Punjab", "Ludhiana", "Amritsar", "Jalandhar", "Patiala",
+        "Bathinda", "Mohali", "Ropar")
+_cities("Rajasthan", "Jaipur", "Jodhpur", "Udaipur", "Kota", "Bikaner",
+        "Ajmer", "Bhilwara", "Alwar")
+_cities("Sikkim", "Gangtok")
+_cities("Tamil Nadu", "Chennai", "Coimbatore", "Madurai",
+        "Tiruchirappalli", "Trichy", "Salem", "Tirunelveli", "Erode",
+        "Tuticorin", "Thoothukudi", "Neyveli", "Cuddalore", "Ennore")
+_cities("Telangana", "Hyderabad", "Warangal", "Nizamabad", "Karimnagar",
+        "Ramagundam")
+_cities("Tripura", "Agartala")
+_cities("Uttar Pradesh", "Lucknow", "Kanpur", "Agra", "Varanasi", "Meerut",
+        "Allahabad", "Prayagraj", "Ghaziabad", "Noida", "Greater Noida",
+        "Bareilly", "Aligarh", "Moradabad", "Gorakhpur", "Jhansi",
+        "Mathura", "Rampur", "Unnao")
+_cities("Uttarakhand", "Dehradun", "Haridwar", "Rishikesh", "Roorkee",
+        "Rudrapur", "Haldwani")
+_cities("West Bengal", "Kolkata", "Howrah", "Durgapur", "Asansol",
+        "Siliguri", "Kharagpur", "Haldia", "Bardhaman", "Burdwan")
+_cities("Delhi", "Delhi", "New Delhi")
+_cities("Chandigarh", "Chandigarh")
+_cities("Puducherry", "Puducherry", "Pondicherry")
+_cities("Jammu and Kashmir", "Jammu", "Srinagar")
+_cities("Ladakh", "Leh")
+
+_CITY_RE = re.compile(
+    r"\b(" + "|".join(re.escape(c) for c in
+                      sorted(CITY_STATE, key=len, reverse=True)) + r")\b",
+    re.I)
+
+# Generic words that precede a state name in these addresses but are not
+# themselves the city, so the fallback heuristic does not report "SOUTH" or
+# "DIST" as the city when the gazetteer has no match.
+_LOCATION_NOISE_RE = re.compile(
+    r"^(?:NORTH|SOUTH|EAST|WEST|DIST|DISTRICT|TALUKA|TEHSIL|PO|PS|VIA|AT|"
+    r"NEAR|OPP|PLOT|SITE|STPP|PROJECT|PLANT|UNIT|OFFICE|GATE|NO)\.?$", re.I)
+
+
+def split_city_state(text: str) -> tuple[str, str]:
+    """Best-effort (city, state) out of one free-text address.
+
+    Never returns the raw blob in either slot - a partial, honestly-derived
+    answer beats a full address dumped unchanged into a field meant to hold
+    one word.
+    """
+    text = (text or "").strip()
+    if not text:
+        return "", ""
+
+    state_m = _STATE_RE.search(text)
+    state = state_m.group(1).strip() if state_m else ""
+
+    city = ""
+    city_m = _CITY_RE.search(text)
+    if city_m:
+        found = city_m.group(1).strip()
+        city = found[0].upper() + found[1:].lower() if found.isupper() else found
+        if not state:
+            state = CITY_STATE[found.upper()]
+    elif state:
+        # No gazetteer hit - fall back to the token just before the state
+        # name, skipping the directional/administrative noise words that
+        # otherwise surround it ("SOUTH SOLAPUR, Maharashtra").
+        before = text[:state_m.start()].rstrip(" ,-")
+        tokens = [t for t in re.split(r"[,\-]", before) if t.strip()]
+        for tok in reversed(tokens):
+            tok = tok.strip()
+            words = [w for w in tok.split() if not _LOCATION_NOISE_RE.match(w)]
+            if words:
+                city = " ".join(words[-2:]).title()
+                break
+
+    return city, state
 
 
 # --------------------------------------------------------------------------
@@ -2029,8 +2200,9 @@ def write_excel(rows: list[dict], out_path: Path) -> Path:
         crm_row['Due Date of Tender'] = sub_date
         
         loc = _val('location')
-        crm_row['State'] = loc
-        crm_row['City Name'] = loc
+        city, state = split_city_state(loc)
+        crm_row['City Name'] = city or loc
+        crm_row['State'] = state
         
         name_val = _val('tender_name')
         if "GEM/" in name_val.upper():
