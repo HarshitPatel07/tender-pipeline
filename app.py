@@ -143,6 +143,8 @@ class ProgressLog(io.TextIOBase):
             self.current_step = "🤖 Groq 120B AI Extraction"
         elif "gemini" in low:
             self.current_step = "✨ Gemini Flash AI Extraction"
+        elif "claude" in low:
+            self.current_step = "🧠 Claude Sonnet 5 AI Extraction (paid)"
         elif "ai pass" in low:
             self.current_step = "🤖 Running Deep AI Extraction"
         elif "writing excel" in low:
@@ -181,21 +183,28 @@ class ProgressLog(io.TextIOBase):
 with st.sidebar:
     st.markdown("### ⚙️ AI Engine Settings")
 
-    # Load default keys from environment (with hardcoded fallbacks)
-    default_groq = os.environ.get("GROQ_API_KEY", "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")
-    default_gemini = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6IFou3sJZ2tQWk1GnBRStT7alF4_mIjS-etpUDrKmbirQ")
+    # Keys come only from environment / Streamlit secrets - never hardcoded
+    # here. A literal key in this file is a live credential sitting in a
+    # GitHub repo the app links back to (the page has its own "Fork" /
+    # GitHub button), visible to anyone who opens it.
+    default_groq = os.environ.get("GROQ_API_KEY", "")
+    default_gemini = os.environ.get("GEMINI_API_KEY", "")
+    default_claude = os.environ.get("ANTHROPIC_API_KEY", "")
 
     ai_provider = st.selectbox(
         "Primary AI Engine",
-        options=["auto", "groq", "gemini", "both"],
+        options=["auto", "groq", "gemini", "claude", "both"],
         format_func=lambda x: {
-            "auto": "🚀 Auto (Groq 120B + Gemini Flash)",
+            "auto": "🚀 Auto (Groq + Gemini, Claude only if both miss a field)",
             "groq": "⚡ Groq (120B Model - Fast & Free)",
             "gemini": "✨ Google Gemini Flash",
-            "both": "🛡️ Dual Mode (Cross-Check Both)",
+            "claude": "🧠 Claude Sonnet 5 (paid - most accurate)",
+            "both": "🛡️ Dual Mode (Cross-Check Groq + Gemini)",
         }[x],
         index=0,
-        help="Select which AI models analyze the tender documents.",
+        help="Auto stays free: Claude is only reached on a pass where Groq "
+             "and Gemini both come back empty, and only if you've supplied "
+             "a Claude key below.",
     )
 
     groq_key_input = st.text_input(
@@ -212,6 +221,16 @@ with st.sidebar:
         help="Free key from aistudio.google.com/apikey",
     )
 
+    claude_key_input = st.text_input(
+        "Claude API Key (optional - paid)",
+        value=default_claude,
+        type="password",
+        help="From console.anthropic.com/settings/keys. Not free like the "
+             "other two - only used if you provide one, and even then only "
+             "as a fallback when Groq/Gemini miss a field (in Auto mode) "
+             "or when you pick Claude directly above.",
+    )
+
     st.markdown("---")
     st.markdown("### 🛠️ Execution Options")
     require_ai = st.checkbox(
@@ -226,7 +245,8 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.caption("💡 **Tip:** Groq 120B provides instant extraction for large tender PDFs without hitting quota limits.")
+    st.caption("💡 **Tip:** Groq 120B provides instant extraction for large tender PDFs without hitting quota limits. "
+               "Claude costs real money per run - leave its key blank to stay fully free.")
 
 
 # Main App Header
@@ -271,6 +291,7 @@ if btn_extract:
         # Configure tender extractor
         groq_k = groq_key_input.strip()
         gemini_k = gemini_key_input.strip()
+        claude_k = claude_key_input.strip()
 
         te.CONFIG.update({
             "source_mode": "drive_link" if source_type == "Google Drive Link" else "local_folder",
@@ -283,6 +304,8 @@ if btn_extract:
             "use_groq": bool(groq_k),
             "gemini_api_key": gemini_k,
             "use_gemini": bool(gemini_k),
+            "claude_api_key": claude_k,
+            "use_claude": bool(claude_k),
             "ai_provider": ai_provider,
             "require_ai": require_ai,
             "use_cache": not fresh_run,

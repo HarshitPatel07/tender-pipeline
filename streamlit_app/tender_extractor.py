@@ -69,9 +69,14 @@ CONFIG = {
     "ocr_max_pages_per_file": 60,      # safety valve on giant scans
     "text_layer_min_chars": 60,        # below this a page is treated as a scan
 
-    # AI Engine (Groq 120B + Gemini Flash)
+    # AI Engine (Groq 120B + Gemini Flash + Claude)
     "use_ai": True,
-    "ai_provider": "auto",             # "auto", "groq", "gemini", or "both"
+    # "auto" tries the free engines (Groq, then Gemini) first and only
+    # spends on Claude if fields are still missing after both - so a run
+    # stays free unless a Claude key is supplied AND the free engines came
+    # up short. "claude" skips straight to Claude. "groq"/"gemini"/"both"
+    # are unchanged from before Claude was added.
+    "ai_provider": "auto",
     "require_ai": True,                # Compulsory AI extraction
 
     # Groq API (High speed, 120B model)
@@ -96,6 +101,17 @@ CONFIG = {
     "gemini_chunk_chars": 200_000,     # per request; merged afterwards
     "gemini_max_chunks": 8,
     "gemini_retries": 4,               # rounds across the whole model list
+
+    # Claude (paid - Anthropic API). Opt-in: only used when a key is
+    # supplied. Sonnet 5 is the cost/quality point for document extraction -
+    # Haiku is cheaper but weaker at the judgment calls this task needs
+    # (telling real content from boilerplate); Opus costs 2.5x Sonnet for a
+    # task that doesn't need Opus-level reasoning.
+    "use_claude": True,
+    "claude_api_key": "",
+    "claude_models": ["claude-sonnet-5"],
+    "claude_chunk_chars": 150_000,
+    "claude_max_chunks": 8,
 
     # Caching: skip re-processing tenders whose files have not changed
     "use_cache": True,
@@ -1564,7 +1580,55 @@ def _call_groq(api_key: str, models: list[str], prompt: str) -> dict:
         if attempt == 0:
             log("   ! All Groq models rate limited. Waiting 10s before final retry pass...")
             time.sleep(10)
-            
+
+    return {}
+
+
+CLAUDE_SYSTEM = (
+    "You are an expert chartered accountant and Indian government tender "
+    "analyst. Extract the requested fields strictly in JSON format adhering "
+    "precisely to the JSON schema provided."
+)
+
+
+def _call_claude(api_key: str, models: list[str], prompt: str) -> dict:
+    """Call Claude with automatic model failover, mirroring _call_groq.
+
+    Paid, so used as a last resort in "auto" mode - only reached when the
+    free engines (Groq, Gemini) left fields missing. No retry-on-rate-limit
+    loop like Groq's: at this run's volume a paid tier rarely gets there,
+    and the SDK's own default retries already cover transient 429/5xx.
+    """
+    try:
+        import anthropic
+    except Exception as e:
+        log(f"   ! anthropic SDK not installed ({e})")
+        return {}
+
+    client = anthropic.Anthropic(api_key=api_key)
+    for model in models:
+        try:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=8192,
+                system=CLAUDE_SYSTEM,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = next((b.text for b in resp.content if b.type == "text"), "")
+            parsed = _parse_json(text)
+            if parsed:
+                log(f"     Claude AI succeeded on {model}")
+                return parsed
+            log(f"   ! Claude {model} returned nothing parseable")
+        except anthropic.AuthenticationError:
+            log("   ! Claude API key invalid or expired")
+            return {}
+        except anthropic.RateLimitError:
+            log(f"   - Claude {model} rate limited")
+            continue
+        except Exception as e:
+            log(f"   ! Claude {model} exception: {str(e)[:80]}")
+            continue
     return {}
 
 
@@ -1768,24 +1832,40 @@ def _merge_ai(results: list[dict]) -> dict[str, Cand]:
     return merged
 
 
-def ai_extract(pages: list[Page], gemini_client, gemini_models, groq_key: str = "", groq_models: list[str] = None):
-    """Unified AI extraction with Groq 120B and Gemini Flash."""
+def ai_extract(pages: list[Page], gemini_client, gemini_models, groq_key: str = "",
+                groq_models: list[str] = None, claude_key: str = "",
+                claude_models: list[str] = None):
+    """Unified AI extraction with Groq 120B, Gemini Flash, and Claude.
+
+    Claude is paid, so it is opt-in and used as a last resort in "auto"
+    mode: only reached on a pass where Groq and Gemini both returned
+    nothing, so a run stays free unless a Claude key is actually supplied
+    and needed.
+    """
     groq_key = (groq_key or CONFIG.get("groq_api_key") or os.environ.get("GROQ_API_KEY") or "").strip()
     groq_models = groq_models or list(CONFIG.get("groq_models") or [
         "openai/gpt-oss-120b", "qwen/qwen3.8-27b", "groq/compound", "openai/gpt-oss-20b"
     ])
+    claude_key = (claude_key or CONFIG.get("claude_api_key") or os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    claude_models = claude_models or list(CONFIG.get("claude_models") or ["claude-sonnet-5"])
 
     use_groq = bool(groq_key) and CONFIG.get("use_groq", True)
     use_gemini = bool(gemini_client) and CONFIG.get("use_gemini", True)
+    use_claude = bool(claude_key) and CONFIG.get("use_claude", True)
 
-    if not use_groq and not use_gemini:
+    if not use_groq and not use_gemini and not use_claude:
         if CONFIG.get("require_ai", True):
-            log("   ! Compulsory AI is enabled, but no valid Groq or Gemini API key was found!")
+            log("   ! Compulsory AI is enabled, but no valid Groq, Gemini, or Claude API key was found!")
         return {}, False
 
     provider = CONFIG.get("ai_provider", "auto").lower()
-    chunk_size = 15_000 if (use_groq and provider in ("auto", "groq")) else 120_000
-    max_chunks = 40 if (use_groq and provider in ("auto", "groq")) else CONFIG.get("gemini_max_chunks", 8)
+    if use_groq and provider in ("auto", "groq"):
+        chunk_size, max_chunks = 15_000, 40
+    elif provider == "claude" and not use_groq and not use_gemini:
+        chunk_size = CONFIG.get("claude_chunk_chars", 150_000)
+        max_chunks = CONFIG.get("claude_max_chunks", 8)
+    else:
+        chunk_size, max_chunks = 120_000, CONFIG.get("gemini_max_chunks", 8)
     corpus = _corpus(pages)
     chunks = _chunks(corpus, chunk_size=chunk_size, max_chunks=max_chunks)
     results = []
@@ -1803,6 +1883,13 @@ def ai_extract(pages: list[Page], gemini_client, gemini_models, groq_key: str = 
         if not res and use_gemini and provider in ("auto", "gemini", "both"):
             log(f"   Gemini AI pass {n}/{len(chunks)} ({len(ch):,} chars)")
             res = _call_gemini(gemini_client, gemini_models, prompt)
+
+        # 3. Last resort: Claude, only when the free engines left this pass
+        # empty and the caller explicitly wants Claude tried ("auto" with a
+        # key present) or asked for it directly.
+        if not res and use_claude and provider in ("auto", "claude"):
+            log(f"   Claude AI pass {n}/{len(chunks)} ({len(ch):,} chars)")
+            res = _call_claude(claude_key, claude_models, prompt)
 
         if res:
             results.append(res)
@@ -2497,7 +2584,9 @@ def _tender_hash(files: list[Path]) -> str:
     return h.hexdigest()[:16]
 
 
-def process_tender(name: str, files: list[Path], client, models, groq_key: str = "", groq_models: list[str] = None) -> dict:
+def process_tender(name: str, files: list[Path], client, models, groq_key: str = "",
+                    groq_models: list[str] = None, claude_key: str = "",
+                    claude_models: list[str] = None) -> dict:
     log(f"\n== {name}  ({len(files)} document(s))")
     pages: list[Page] = []
     file_log = []
@@ -2523,9 +2612,10 @@ def process_tender(name: str, files: list[Path], client, models, groq_key: str =
     log(f"   {len(pages)} page(s), {total_chars:,} characters of text")
     mark_boilerplate(pages)
     rules = rules_extract(pages, name)
-    ai, ai_ok = ai_extract(pages, client, models, groq_key, groq_models)
-    
-    ai_active = bool(client or groq_key)
+    ai, ai_ok = ai_extract(pages, client, models, groq_key, groq_models,
+                           claude_key, claude_models)
+
+    ai_active = bool(client or groq_key or claude_key)
     if CONFIG.get("require_ai", True) and ai_active and not ai_ok:
         log("   ! Compulsory AI extraction failed; falling back to rules")
 
@@ -2537,7 +2627,9 @@ def process_tender(name: str, files: list[Path], client, models, groq_key: str =
         provider_labels.append("Groq 120B")
     if client and CONFIG.get("use_gemini", True):
         provider_labels.append("Gemini Flash")
-    
+    if claude_key and CONFIG.get("use_claude", True):
+        provider_labels.append("Claude Sonnet 5")
+
     lbl = " + ".join(provider_labels) if provider_labels else "Rules only"
     if not ai_ok and ai_active:
         lbl += " (AI unreachable; rules fallback)"
@@ -2622,13 +2714,18 @@ def run() -> Path:
     groq_models = CONFIG.get("groq_models") or [
         "openai/gpt-oss-120b", "qwen/qwen3.8-27b", "groq/compound", "openai/gpt-oss-20b"
     ]
+    claude_key = (CONFIG.get("claude_api_key") or os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    claude_models = CONFIG.get("claude_models") or ["claude-sonnet-5"]
     client, models = (_gemini_client() if CONFIG.get("use_gemini", True) else (None, None))
 
     if groq_key:
         print("   * Groq AI active (120B reasoning engine)")
     if client:
         print(f"   * Gemini AI active (model: {models[0] if models else 'flash'})")
-    if not groq_key and not client:
+    if claude_key:
+        print(f"   * Claude AI active (paid - {claude_models[0]}, used only if the "
+              f"free engines leave fields missing)")
+    if not groq_key and not client and not claude_key:
         if CONFIG.get("require_ai", True):
             print("   ! WARNING: AI is set to compulsory, but no API keys were configured!")
         else:
@@ -2650,7 +2747,8 @@ def run() -> Path:
             except Exception:
                 pass
         try:
-            row = process_tender(name, files, client, models, groq_key, groq_models)
+            row = process_tender(name, files, client, models, groq_key, groq_models,
+                                 claude_key, claude_models)
         except Exception:
             log(f"   ! {name} failed:\n{traceback.format_exc(limit=3)}")
             row = {"tender": name, "files": [], "ai_ok": True,
