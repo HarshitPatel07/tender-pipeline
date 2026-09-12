@@ -2192,6 +2192,63 @@ def split_city_state(text: str) -> tuple[str, str]:
 
 
 # --------------------------------------------------------------------------
+# 5c. CRM-ONLY EXTRAS  -  fields with a Zoho column but no place among the 13
+# --------------------------------------------------------------------------
+#
+# These feed only the CRM Import sheet, never Tender Summary or the 13-field
+# schema - additive, so they cannot change anything about how the 13 fields
+# are found. Both are read directly off the tender's own documents, the same
+# way the 13 fields are: BID_OPENING_RE and PRE_BID_RE were written against
+# 210347177.pdf and 210347179.pdf from tender 2026-9533, where the bilingual
+# (Hindi/English) GeM template states "Bid Opening Date/Time" as its own
+# line, separate from the submission deadline already captured as
+# submission_date, and "Pre-Bid Conference Date & Time" as a distinct line
+# usually answered "Not Applicable".
+
+BID_OPENING_RE = re.compile(r"Bid\s*Opening\s*(?:Date\s*(?:/|&)?\s*Time)?", re.I)
+PRE_BID_RE = re.compile(
+    r"Pre[\s-]*Bid\s*(?:Conference|Meeting)\s*(?:Date\s*(?:&|and)?\s*Time)?"
+    r"\s*\(?(?:if\s*any)?\)?", re.I)
+
+
+def _value_after_label(text: str, label_re: re.Pattern, window: int = 150) -> str:
+    """First date, or first explicit nil phrase, within `window` chars of a
+    label match. Deliberately narrow: returns nothing rather than guessing
+    when neither is present, consistent with every other extractor here."""
+    m = label_re.search(text)
+    if not m:
+        return ""
+    tail = text[m.end(): m.end() + window]
+    date_m = DATE_RE.search(tail)
+    if date_m:
+        return date_m.group(0).strip()
+    nil_m = EXPLICIT_NIL_RE.search(tail)
+    if nil_m:
+        return nil_m.group(0).strip().title()
+    return ""
+
+
+def extract_bid_opening(pages: list[Page]) -> str:
+    """The bid/technical-bid opening date, when the documents state one
+    separately from the submission deadline."""
+    for pg in _ordered_pages(pages):
+        val = _value_after_label(pg.text or "", BID_OPENING_RE)
+        if val:
+            return val
+    return ""
+
+
+def extract_pre_bid_meeting(pages: list[Page]) -> str:
+    """The pre-bid conference date, or an explicit 'Not Applicable' when the
+    tender states there isn't one - itself a real answer, not a miss."""
+    for pg in _ordered_pages(pages):
+        val = _value_after_label(pg.text or "", PRE_BID_RE)
+        if val:
+            return val
+    return ""
+
+
+# --------------------------------------------------------------------------
 # 6. EXCEL OUTPUT
 # --------------------------------------------------------------------------
 
@@ -2390,7 +2447,22 @@ def write_excel(rows: list[dict], out_path: Path,
         # the tender number's own format states the portal it was floated on.
         if is_gem:
             crm_row['Tender Selection Method'] = 'GeM'
-            
+
+        # Read straight off the documents (extract_bid_opening /
+        # extract_pre_bid_meeting), not fabricated: both were blank before
+        # because nothing ever looked for them, not because the tenders
+        # don't state them. Same value in both bid-opening columns - these
+        # GeM tenders give one opening time, not separate technical/price
+        # ones.
+        extras = row.get("crm_extras") or {}
+        bid_opening = extras.get("bid_opening", "")
+        if bid_opening:
+            crm_row['Tech. Bid Opening'] = bid_opening
+            crm_row['Fin. Bid Opening'] = bid_opening
+        pre_bid = extras.get("pre_bid_meeting", "")
+        if pre_bid:
+            crm_row['Pre-Bid meeting'] = pre_bid
+
         # Every one of the 13 fields must land somewhere in this sheet, not
         # just the ones with a matching Zoho column. Period and Assignment
         # Fees have no dedicated CRM field - the fixed 51-column template
@@ -2634,8 +2706,12 @@ def process_tender(name: str, files: list[Path], client, models, groq_key: str =
     if not ai_ok and ai_active:
         lbl += " (AI unreachable; rules fallback)"
     log(f"   -> {found}/13 fields found [{lbl}]")
+    crm_extras = {
+        "bid_opening": extract_bid_opening(pages),
+        "pre_bid_meeting": extract_pre_bid_meeting(pages),
+    }
     return {"tender": name, "results": results, "files": file_log,
-            "ai_ok": ai_ok}
+            "ai_ok": ai_ok, "crm_extras": crm_extras}
 
 
 # Stale caches from an older, weaker engine must never be silently reused.
@@ -2669,6 +2745,7 @@ def _to_json(row: dict) -> str:
         "tender": row["tender"], "files": row["files"],
         "ai_ok": row.get("ai_ok", True),
         "results": {k: vars(v) for k, v in row["results"].items()},
+        "crm_extras": row.get("crm_extras") or {},
     }, ensure_ascii=False)
 
 
@@ -2676,7 +2753,8 @@ def _from_json(txt: str) -> dict:
     d = json.loads(txt)
     return {"tender": d["tender"], "files": d["files"],
             "ai_ok": d.get("ai_ok", True),
-            "results": {k: Result(**v) for k, v in d["results"].items()}}
+            "results": {k: Result(**v) for k, v in d["results"].items()},
+            "crm_extras": d.get("crm_extras") or {}}
 
 
 # Populated by run() so a caller (e.g. the notebook, to render the dashboard
